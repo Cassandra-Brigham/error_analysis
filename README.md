@@ -37,6 +37,13 @@ The core of the workflow is a comprehensive, customizable geostatistical analysi
 - **Uncertainty Propagation** : The tool propagates correlated uncertainty using the parameters from the variogram analysis and uncorrelated uncertainty based on the dataset's RMS. These are summed in quadrature to estimate a total mean uncertainty for a specified area.
 - **Advanced Options** : Users can select from multiple variogram models (e.g., Matérn, Gaussian), adjust model parameters, and iterate on the analysis for in-depth control.
 
+## Cloud-Based On-Demand Implementation
+
+For users seeking a more streamlined and accessible option, the workflow is also implemented as a cloud-native, on-demand tool within the OpenTopography platform (https://opentopography.org). This version is ideal for rapid exploratory analysis and is designed to be accessible to a broad range of users, regardless of their coding skills.
+
+- **Simplified Interface** : The tool operates through an easy-to-use web interface with minimal user input. The uncertainty calculation can be enabled by simply checking a box.
+- **Automated Workflow** : This implementation automates the entire process, from data selection and pre-processing to error analysis. It relies on a few simplifying assumptions, such as treating all observed differences as potential error, to function without user-defined stable areas. Mean uncertainty estimates from the on-demand tool tend to be smaller than those from the feature-specific analysis, since the uncertainty values are for net change across a large region.
+- **No Installation Required** : As a web-based tool, it eliminates the need to download large datasets or install complex software, leveraging the high-performance computing resources at the San Diego Supercomputer Center. It provides a direct path for users to shift from a local workflow to one where data and processing are co-located in the cloud.
 
 ## Repository Structure
 
@@ -78,6 +85,19 @@ pip install -r requirements.txt
 ```
 
 > If you encounter issues building GDAL/Rasterio/Shapely on your OS, prefer the Conda route above.
+
+## Cloud-Based Notebook (Google Colab)
+
+You can run the notebook in your browser without any local installation using Google Colab. This is an excellent option for users who want to get started quickly or who do not have a local Python environment set up.
+
+The Jupyter Notebook is designed to be Colab-friendly and contains specific cells at the beginning to handle the installation of all necessary dependencies within the Colab environment.
+
+### Instructions for Google Colab:
+1. **Open the notebook in Colab.** You can do this by navigating to Google Colab and selecting the notebook file from GitHub or by uploading it from your computer.
+
+2. **Run the setup cells.** Execute the first few cells in the notebook. These cells use commands like !pip install and !apt-get install to prepare the cloud environment with all required geospatial libraries, such as GDAL, rasterio, and geopandas.
+
+3. **Proceed with the analysis.** Once the dependencies are installed, you can run the rest of the notebook cells sequentially to perform the data input, processing, and uncertainty analysis steps.
 
 ## Quick Start
 

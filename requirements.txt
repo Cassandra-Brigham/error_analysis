@@ -1,0 +1,15 @@
+geopandas
+ipyleaflet
+ipywidgets
+matplotlib
+numba
+numpy
+osgeo
+pandas
+pdal
+pyproj
+rasterio
+requests
+rioxarray
+scipy
+shapely

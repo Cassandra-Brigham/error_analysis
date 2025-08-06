@@ -1,2 +1,6 @@
+#Inputs and outputs
 /data
 /outputs
+
+# Python cache and compiled files
+__pycache__/

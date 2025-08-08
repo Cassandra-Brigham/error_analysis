@@ -1,6 +1,13 @@
 #Inputs and outputs
 /data
 /outputs
+results.json
+
+#older code versions
+/older_versions
 
 # Python cache and compiled files
 __pycache__/
+
+# OS-specific files
+.DS_Store

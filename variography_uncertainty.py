@@ -1,18 +1,23 @@
 """Classes and functions for analyzing vertical differencing uncertainty.
 
-This module provides a set of utilities for loading raster data,
-sampling it for variogram analysis, fitting parametric semivariogram
-models, and propagating uncertainty to user-defined areas.  It
-implements numerically efficient algorithms via Numba for pairwise
-distance calculations, supports bootstrap resampling for parameter
-confidence intervals, and exposes high-level classes such as
-``RasterDataHandler``, ``StatisticalAnalysis``, ``VariogramAnalysis``,
-and ``RegionalUncertaintyEstimator`` to support a complete workflow
-from raster preparation through uncertainty estimation.
+This module provides utilities for loading raster data, sampling for variogram
+analysis, fitting parametric semivariogram models, and propagating uncertainty
+to user-defined areas. It implements efficient Numba kernels for pairwise
+calculations, supports bootstrap resampling for parameter confidence intervals,
+and exposes high-level classes:
+
+- RasterDataHandler
+- StatisticalAnalysis
+- VariogramAnalysis
+- RegionalUncertaintyEstimator
+- ApplyUncertainty
+
 """
 
+from __future__ import annotations
+
 import math
-from typing import Sequence, Optional, Dict, Any
+from typing import Sequence, Optional, Dict, Any, Callable
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
@@ -23,296 +28,217 @@ import rioxarray as rio
 from numba import njit, prange
 from pathlib import Path
 from shapely.geometry import Polygon, MultiPolygon, Point, box, shape
-import random
+from shapely.prepared import prep
 import geopandas as gpd
 from rasterio.features import shapes
 from shapely.ops import unary_union
 
 
-def dropna(array):
-    """
-    Drops NaN values from a NumPy array.
-
-    Parameters
-    ----------
-    array : np.ndarray
-        The input NumPy array from which to drop NaN values.
-
-    Returns
-    -------
-    np.ndarray
-        A new array with NaN values removed.
-    """
-    return array[~np.isnan(array)]
-
 class RasterDataHandler:
     """
-    A class used for loading vertical differencing raster data, 
-    subtracting a vertical systematic error from the raster,
-    and randomly sampling the raster data for further analysis.
+    Load vertical differencing raster data, subtract a vertical systematic error
+    from the raster, and randomly sample raster data for further analysis.
 
     Attributes
     ----------
     raster_path : str
-        The file path to the raster data.
+        File path to the raster data.
     unit : str
-        The unit of measurement for the raster data (for plotting labels).
+        Unit of measurement for the raster data (for plotting labels).
     resolution : float
-        The resolution of the raster data.
-    rioxarray_obj : rioxarray.DataArray or None
+        Nominal raster resolution (linear units).
+    rioxarray_obj : rioxarray.DataArray | None
         The rioxarray object holding the raster data.
-    data_array : numpy.ndarray or None
-        The loaded raster data as a 1D NumPy array (NaNs removed).
-    transformed_values : numpy.ndarray or None
-        Placeholder for any future transformations if needed.
-    samples : numpy.ndarray or None
-        Sampled values from the raster data.
-    coords : numpy.ndarray or None
-        Coordinates of the sampled values.
-
-    Methods
-    -------
-    load_raster(masked=True)
-        Loads the raster data from the given path, optionally applying a mask to exclude NaN values.
-    subtract_value_from_raster(output_raster_path, value_to_subtract)
-        Subtracts a given value from the raster data and saves the result to a new file.
-    plot_raster(plot_title)
-        Plots a raster image using the loaded rioxarray object.
-    sample_raster(area_side, samples_per_area, max_samples)
-        Samples the raster data based on a given density and maximum number of samples.
+    data_array : np.ndarray | None
+        Loaded raster values as a 1D array of finite pixels.
+    samples : np.ndarray | None
+        Sampled values from the raster.
+    coords : np.ndarray | None
+        Coordinates (x, y) of the sampled values.
+    bbox : shapely.geometry.Polygon
+        Bounding box of the raster.
     """
-    def __init__(self, raster_path, unit, resolution):
-        """
-        Initialize the RasterDataHandler.
 
-        Parameters
-        ----------
-        raster_path : str
-            The file path to the raster data.
-        unit : str
-            The unit of measurement for the raster data.
-        resolution : float
-            The resolution of the raster data.
-        """
+    def __init__(self, raster_path: str, unit: str, resolution: float):
         self.raster_path = raster_path
         self.unit = unit
         self.resolution = resolution
         self.rioxarray_obj = None
         self.data_array = None
-        self.transformed_values = None
         self.samples = None
         self.coords = None
         self.shapely_geoms = None
         self.merged_geom = None
         self.detailed_area = None
-        
+
         with rasterio.open(self.raster_path) as src:
             bounds = src.bounds
             self.bounds = (bounds.left, bounds.bottom, bounds.right, bounds.top)
-            # create a Shapely geometry for the bbox
             self.bbox = box(*self.bounds)
-    
-    def get_detailed_area(self):  # long
-        """Compute the precise area covered by valid data in the raster.
 
-        This method reads the raster, identifies all pixels that are not
-        nodata or NaN, converts the resulting mask into shapes, and
-        merges them into a single geometry.  The merged geometry and
-        its area are stored on the instance as ``self.merged_geom`` and
-        ``self.detailed_area`` respectively.  The list of individual
-        geometries is stored in ``self.shapely_geoms`` for further
-        processing.
+    def get_detailed_area(self) -> None:
+        """
+        Compute the precise area covered by valid data in the raster by vectorizing
+        the finite/nodata mask into polygon shapes and dissolving them.
         """
         with rasterio.open(self.raster_path) as src:
-            # read first band into a 2D array
-            data = src.read(1)
+            data = src.read(1).astype(float)
             nodata = src.nodata
-            mask = (data != nodata) if nodata is not None else ~np.isnan(data)
-            geoms = shapes(data, mask=mask, transform=src.transform)
-            # convert each (geom, value) pair into a Shapely object
-        self.shapely_geoms = [shape(geom) for geom, value in geoms]
+            valid = (~np.isnan(data)) if nodata is None else ((data != nodata) & ~np.isnan(data))
+            geoms = shapes(valid.astype(np.uint8), mask=valid, transform=src.transform)
+        self.shapely_geoms = [shape(geom) for geom, val in geoms if val == 1]
         self.merged_geom = unary_union(self.shapely_geoms)
         self.detailed_area = self.merged_geom.area
 
-    def load_raster(self, masked=True):
+    def load_raster(self, masked: bool = True) -> None:
         """
-        Loads the raster data from the specified path, applying a mask to exclude NaN values if requested.
+        Load raster data and store finite values in self.data_array.
 
         Parameters
         ----------
-        masked : bool, optional
-            If True, NaN values in the raster data will be masked (default is True).
+        masked : bool
+            If True, open as masked and coerce mask to NaN.
         """
-        self.rioxarray_obj = rio.open_rasterio(self.raster_path, masked=masked)
-        self.data_array = self.rioxarray_obj.data[~np.isnan(self.rioxarray_obj.data)].flatten()
+        
+        da = rio.open_rasterio(self.raster_path, masked=masked)
+        if "band" in da.dims and da.sizes.get("band", 1) == 1:
+            da = da.squeeze("band", drop=True)
+        arr = da.values
+        if np.ma.isMaskedArray(arr):
+            arr = arr.filled(np.nan)
+        nodata = da.rio.nodata
+        valid = np.isfinite(arr)
+        if nodata is not None:
+            valid &= (arr != nodata)
+        self.rioxarray_obj = da
+        self.data_array = np.asarray(arr[valid], dtype=float).ravel()
 
-    def subtract_value_from_raster(self, output_raster_path, value_to_subtract):
+    def subtract_value_from_raster(self, output_raster_path: str, value_to_subtract: float) -> None:
         """
-        Subtracts a specified value from the raster data and saves the resulting raster to a new file.
+        Subtract a specified value from the raster and write a new file.
 
         Parameters
         ----------
         output_raster_path : str
-            The file path where the modified raster will be saved.
+            Path to the output raster.
         value_to_subtract : float
-            The value to be subtracted from each pixel in the raster data.
+            Value to subtract from each valid pixel.
         """
         with rasterio.open(self.raster_path) as src:
             data = src.read()
             nodata = src.nodata
-
-            # Create a mask of valid data
-            if nodata is not None:
-                mask = data != nodata
-            else:
-                mask = np.ones(data.shape, dtype=bool)
-
+            mask = (data != nodata) if nodata is not None else np.ones(data.shape, dtype=bool)
             data = data.astype(float)
             data[mask] -= value_to_subtract
-
             out_meta = src.meta.copy()
             out_meta.update({'dtype': 'float32', 'nodata': nodata})
-
             with rasterio.open(output_raster_path, 'w', **out_meta) as dst:
                 dst.write(data)
 
-    def plot_raster(self, plot_title):
+    def plot_raster(self, plot_title: str):
         """
-        Plots a raster image using the rioxarray object.
+        Plot the loaded rioxarray DataArray with a diverging colormap.
 
-        Parameters
-        ----------
-        plot_title : str
-            The title of the plot.
-
-        Returns
-        -------
-        matplotlib.figure.Figure
-            The figure object containing the plot.
+        Raises
+        ------
+        RuntimeError
+            If raster has not been loaded yet.
         """
+        
+        if self.rioxarray_obj is None:
+            raise RuntimeError("Raster not loaded. Call load_raster() first.")
         rio_data = self.rioxarray_obj
         fig, ax = plt.subplots(figsize=(10, 6))
         rio_data.plot(cmap="bwr_r", ax=ax, robust=True)
         ax.set_title(plot_title, pad=30)
-        ax.set_xlabel('Easting (m)')
-        ax.set_ylabel('Northing (m)')
+        ax.set_xlabel('Easting')
+        ax.set_ylabel('Northing')
         ax.ticklabel_format(style="plain")
         ax.set_aspect('equal')
         return fig
 
-    def sample_raster(self, area_side, samples_per_area, max_samples):
+    def sample_raster(
+        self,
+        area_side: float,
+        samples_per_area: float,
+        max_samples: int,
+        *,
+        seed: Optional[int] = None
+    ) -> None:
         """
-        Samples the raster data based on a given density and a maximum number of samples,
-        returning the sampled values and their coordinates.
-
-        The parameter 'area_side' is used as a reference to convert the cell size into
-        square km if 'area_side' is given in meters (e.g., area_side=1000 for 1 km side).
+        Randomly sample valid pixels from the raster, storing (values, coords).
 
         Parameters
         ----------
         area_side : float
-            The reference for converting pixel area into square km (if in meters).
+            Reference side length used to convert pixel area to reference-area units
+            (e.g., 1000 for km² if coordinates are meters).
         samples_per_area : float
-            The number of samples to draw per square kilometer.
+            Number of samples to draw per unit of reference area.
         max_samples : int
-            The maximum total number of samples to draw.
+            Maximum total samples to draw.
+        seed : int | None
+            RNG seed for reproducibility.
 
-        Returns
-        -------
-        None
-            (But populates self.samples and self.coords with the drawn sample values
-            and corresponding coordinates.)
+        Raises
+        ------
+        ValueError
+            If requested samples exceed valid pixels, or computed total is < 1.
         """
         with rasterio.open(self.raster_path) as src:
-            data = src.read(1)
+            rng = np.random.default_rng(seed)
+
+            data = src.read(1).astype(float)
             nodata = src.nodata
-            valid_data_mask = data != nodata if nodata is not None else ~np.isnan(data)
+            valid = np.isfinite(data)
+            if nodata is not None:
+                valid &= (data != nodata)
 
-            cell_size = src.res[0]  # Pixel size in x-direction
-            # Approx. area of each pixel in "km^2" if area_side = 1000.
-            cell_area_sq_km = (cell_size ** 2) / (area_side ** 2)
+            cell_area_m2 = abs(src.res[0] * src.res[1])
+            valid_rows, valid_cols = np.where(valid)
+            valid_count = valid_rows.size
+            cell_area_in_reference = cell_area_m2 / (area_side ** 2)
+            total_samples = min(int(cell_area_in_reference * samples_per_area * valid_count), max_samples)
 
-            # Find valid data points
-            valid_data_indices = np.where(valid_data_mask)
-            valid_data_count = valid_data_indices[0].size
+            
+            if total_samples < 1:
+                raise ValueError("Computed total_samples < 1; increase samples_per_area or max_samples.")
 
-            # Estimate total samples based on area
-            total_samples = min(int(cell_area_sq_km * samples_per_area * valid_data_count), max_samples)
+            if total_samples > valid_count:
+                raise ValueError("Requested samples exceed the number of valid points.")
 
-            if total_samples > valid_data_count:
-                raise ValueError("Requested samples exceed the number of valid data points.")
-
-            # Randomly select valid data points
-            chosen_indices = np.random.choice(valid_data_count, size=total_samples, replace=False)
-            rows = valid_data_indices[0][chosen_indices]
-            cols = valid_data_indices[1][chosen_indices]
-
-            # Get sampled data values
+            chosen = rng.choice(valid_count, size=total_samples, replace=False)
+            rows = valid_rows[chosen]
+            cols = valid_cols[chosen]
             samples = data[rows, cols]
-
-            # Compute coordinates all at once for efficiency
             x_coords, y_coords = src.xy(rows, cols)
             coords = np.vstack([x_coords, y_coords]).T
 
-            # Remove any NaNs
-            mask = ~np.isnan(samples)
-            filtered_samples = samples[mask]
-            filtered_coords = coords[mask]
+            mask = np.isfinite(samples)
+            self.samples = samples[mask]
+            self.coords = coords[mask]
 
-            self.samples = filtered_samples
-            self.coords = filtered_coords
 
 class StatisticalAnalysis:
     """
-    A class to perform statistical analysis on data, including plotting data statistics
-    and estimating the uncertainty of the median value of the data using bootstrap 
-    resampling with subsamples of the data.
-
-    Attributes
-    ----------
-    raster_data_handler : RasterDataHandler
-        An instance of RasterDataHandler to manage raster data operations.
-
-    Methods
-    -------
-    plot_data_stats(filtered=True)
-        Plots the histogram of the raster data with exploratory statistics.
-    bootstrap_uncertainty_subsample(n_bootstrap=1000, subsample_proportion=0.1)
-        Estimates the uncertainty of the median value of the data using bootstrap resampling.
+    Statistical utilities for exploratory plotting and bootstrap uncertainty of the median.
     """
-    def __init__(self, raster_data_handler):
-        """
-        Initialize the StatisticalAnalysis class.
 
-        Parameters
-        ----------
-        raster_data_handler : RasterDataHandler
-            An instance of RasterDataHandler to manage raster data operations.
-        """
+    def __init__(self, raster_data_handler: RasterDataHandler):
         self.raster_data_handler = raster_data_handler
 
-    def plot_data_stats(self, filtered=True):
+    def plot_data_stats(self, filtered: bool = True):
         """
-        Plots the histogram of the raster data with exploratory statistics.
+        Plot histogram of raster values with basic statistics annotated.
 
         Parameters
         ----------
-        filtered : bool, optional
-            If True, filter the data to exclude outliers (1st and 99th percentiles) 
-            for better visualization. If False, use the unfiltered data. Default is True.
+        filtered : bool
+            If True, clip to 1st–99th percentiles for visualization only.
 
         Returns
         -------
-        fig : matplotlib.figure.Figure
-            The matplotlib figure object containing the histogram and statistics.
-
-        Notes
-        -----
-        - The function calculates and displays the mean, median, mode(s), minimum, maximum, 
-          1st quartile, and 3rd quartile of the data.
-        - The histogram is plotted with 60 bins (by default).
-        - The mode(s) are displayed as vertical dashed lines on the histogram.
-        - A text box with the calculated statistics is added to the plot.
+        matplotlib.figure.Figure
         """
         data = self.raster_data_handler.data_array
         if data is None or len(data) == 0:
@@ -320,8 +246,9 @@ class StatisticalAnalysis:
 
         mean = np.mean(data)
         median = np.median(data)
-        mode_result = stats.mode(data, nan_policy='omit')
-        mode_val = mode_result.mode
+        # NOTE: mode on continuous data is often not meaningful; kept for completeness.
+        mode_result = stats.mode(data, nan_policy="omit", keepdims=False)
+        mode_vals = np.atleast_1d(mode_result.mode).astype(float)
         q1 = np.percentile(data, 25)
         q3 = np.percentile(data, 75)
         p1 = np.percentile(data, 1)
@@ -329,39 +256,29 @@ class StatisticalAnalysis:
         minimum = np.min(data)
         maximum = np.max(data)
 
-        # Optionally filter outliers for visualization
         if filtered:
             data = data[(data >= p1) & (data <= p99)]
 
-        # Ensure mode_val is iterable
-        if not isinstance(mode_val, np.ndarray):
-            mode_val = np.array([mode_val])
-
         fig, ax = plt.subplots()
-        # Plot histogram
         ax.hist(data, bins=60, density=False, alpha=0.6, color='g')
         ax.axvline(mean, color='r', linestyle='dashed', linewidth=1, label='Mean')
         ax.axvline(median, color='b', linestyle='dashed', linewidth=1, label='Median')
-        for i, m in enumerate(mode_val):
-            label = 'Mode' if i == 0 else "_nolegend_"
-            ax.axvline(m, color='purple', linestyle='dashed', linewidth=1, label=label)
+        for i, m in enumerate(mode_vals):
+            ax.axvline(m, color='purple', linestyle='dashed', linewidth=1,
+                       label='Mode' if i == 0 else "_nolegend_")
 
-        # Prepare statistics text
-        mode_str = ", ".join([f'{m:.3f}' for m in mode_val])
-        textstr = '\n'.join((
-            f'Mean: {mean:.3f}',
-            f'Median: {median:.3f}',
-            f'Mode(s): {mode_str}',
-            f'Minimum: {minimum:.3f}',
-            f'Maximum: {maximum:.3f}',
-            f'1st Quartile: {q1:.3f}',
-            f'3rd Quartile: {q3:.3f}'
+        mode_str = ", ".join([f"{m:.3f}" for m in mode_vals])
+        textstr = "\n".join((
+            f"Mean: {mean:.3f}",
+            f"Median: {median:.3f}",
+            f"Mode(s): {mode_str}",
+            f"Min: {minimum:.3f}  Max: {maximum:.3f}",
+            f"Q1: {q1:.3f}  Q3: {q3:.3f}",
         ))
 
         props = dict(boxstyle='round', facecolor='wheat', alpha=0.5)
         ax.text(0.05, 0.95, textstr, transform=ax.transAxes, fontsize=10,
                 verticalalignment='top', bbox=props)
-
         ax.set_xlabel(f'Vertical Difference ({self.raster_data_handler.unit})')
         ax.set_ylabel('Count')
         ax.set_title('Histogram of differencing results with exploratory statistics')
@@ -369,70 +286,50 @@ class StatisticalAnalysis:
         plt.tight_layout()
         return fig
 
-    def bootstrap_uncertainty_subsample(self, n_bootstrap=1000, subsample_proportion=0.1):
+    def bootstrap_uncertainty_subsample(self, n_bootstrap: int = 1000, subsample_proportion: float = 0.1) -> float:
         """
-        Estimates the uncertainty of the median value of the data using bootstrap resampling.
-        This method randomly samples subsets of the data, calculates their medians, and then 
-        computes the standard deviation of these medians as a measure of uncertainty.
+        Estimate uncertainty of the median via bootstrap on random subsamples.
 
         Parameters
         ----------
-        n_bootstrap : int, optional
-            The number of bootstrap samples to generate (default is 1000).
-        subsample_proportion : float, optional
-            The proportion of the data to include in each subsample (default is 0.1).
+        n_bootstrap : int
+            Number of bootstrap resamples.
+        subsample_proportion : float
+            Fraction of data per resample.
 
         Returns
         -------
-        uncertainty : float
-            The standard deviation of the bootstrap medians, representing 
-            the uncertainty of the median value.
+        float
+            Standard deviation of bootstrap medians.
         """
-        if (self.raster_data_handler.data_array is None or 
-            len(self.raster_data_handler.data_array) == 0):
+        data = self.raster_data_handler.data_array
+        if data is None or len(data) == 0:
             raise ValueError("No data available for bootstrap. Please load the raster first.")
 
-        subsample_size = int(subsample_proportion * len(self.raster_data_handler.data_array))
+        
+        subsample_size = max(1, int(round(subsample_proportion * len(data))))
+        rng = np.random.default_rng()
         bootstrap_medians = np.zeros(n_bootstrap)
         for i in range(n_bootstrap):
-            sample = np.random.choice(self.raster_data_handler.data_array,
-                                      size=subsample_size,
-                                      replace=True)
+            sample = rng.choice(data, size=subsample_size, replace=True)
             bootstrap_medians[i] = np.median(sample)
+        return float(np.std(bootstrap_medians))
 
-        return np.std(bootstrap_medians)
 
 class VariogramAnalysis:
     """
-    A class to perform variogram analysis on raster data. It calculates mean variograms,
-    fits spherical models (possibly with a nugget term) to the variogram data, and plots
-    the results. The code supports multiple runs to produce a mean variogram and uses
-    bootstrapping to estimate parameter uncertainties.
+    Compute empirical variograms across multiple random samples, fit spherical
+    models (with optional nugget), and bootstrap parameter uncertainty.
     """
+
     MIN_PAIRS = 10
-    def __init__(self, raster_data_handler):
-        """Initialize a ``VariogramAnalysis`` instance for a given raster.
 
-        Parameters
-        ----------
-        raster_data_handler : RasterDataHandler
-            An instance of :class:`RasterDataHandler` containing the raster
-            data and sampling utilities required for variogram estimation.
-
-        Notes
-        -----
-        This constructor merely stores the provided data handler and
-        initializes various attributes used during variogram calculation
-        and model fitting.  To compute an empirical variogram, call
-        :meth:`calculate_mean_variogram_numba`.  To fit a parametric
-        model, use :meth:`fit_best_spherical_model`.
-        """
+    def __init__(self, raster_data_handler: RasterDataHandler):
         self.raster_data_handler = raster_data_handler
         self.mean_variogram = None
         self.lags = None
         self.mean_count = None
         self.err_variogram = None
-        self.best_model_config = None
         self.fitted_variogram = None
         self.rmse = None
         self.sills = None
@@ -461,10 +358,9 @@ class VariogramAnalysis:
         self.best_bounds = None
         self.all_variograms = None
         self.all_counts = None
-        self.param_samples = None
+
     
     
-            
     @staticmethod
     @njit(parallel=True)
     def bin_distances_and_squared_differences(coords, values, bin_width, max_lag_multiplier, x_extent, y_extent):
@@ -491,8 +387,10 @@ class VariogramAnalysis:
         
         if max_lag_multiplier == "max":
             max_lag = approx_max_distance
+        elif max_lag_multiplier == "median":
+            max_lag = 0.5 * approx_max_distance  # simple heuristic
         else:
-            max_lag = int(approx_max_distance*max_lag_multiplier)
+            max_lag = float(approx_max_distance * max_lag_multiplier)
         
         #Determine bin edges using diagonal distance as maximum possible lag distance
         n_bins = int(np.ceil(max_lag / bin_width)) + 1
@@ -531,455 +429,333 @@ class VariogramAnalysis:
         binned_sum_squared_diff = binned_sum_squared_diff[:n_bins]
 
         return n_bins, bin_counts, binned_sum_squared_diff, max_distance, max_lag
-    
+
     @staticmethod
-    def compute_matheron(bin_counts, ssd, min_pairs=8):
+    def compute_matheron(bin_counts, ssd, min_pairs: int = 10) -> np.ndarray:
         """
-        Compute Matheron’s semivariance estimator for binned pairwise differences.
-        This function calculates the empirical semivariogram γ(h) for each lag bin
-        using Matheron’s estimator:
-            γ(h) = SSD(h) / (2 · N(h))
-        where SSD(h) is the sum of squared differences of all point pairs within
-        lag bin h, and N(h) is the number of pairs in that bin. Bins with fewer
-        than `min_pairs` are assigned NaN.
-        Args:
-            bin_counts (array-like of int):
-                Number of point‐pair observations in each lag bin.
-            ssd (array-like of float):
-                Sum of squared differences of measurements for each lag bin.
-            min_pairs (int, optional):
-                Minimum number of pairs required to compute a reliable estimate.
-                Bins with counts below this threshold will be set to NaN.
-                Defaults to 8.
-        Returns:
-            numpy.ndarray of float:
-                Semivariance estimates for each lag bin. Bins with
-                `bin_counts[i] < min_pairs` are returned as NaN.
+        Compute Matheron semivariance γ(h) = SSD(h) / (2 N(h)) for bins with >= min_pairs.
         """
-    
-        γ = np.full_like(bin_counts, np.nan, dtype=float)
-        for i,(cnt,sum_sq) in enumerate(zip(bin_counts,ssd)):
+        gamma_est = np.full_like(bin_counts, np.nan, dtype=float)
+        for i, (cnt, sum_sq) in enumerate(zip(bin_counts, ssd)):
             if cnt >= min_pairs:
-                γ[i] = sum_sq/(2*cnt)
-        return γ
-    
-    def numba_variogram(self, area_side, samples_per_area, max_samples, bin_width, max_lag_multiplier):
+                gamma_est[i] = sum_sq / (2.0 * cnt)
+        return gamma_est
+
+    def numba_variogram(
+        self,
+        area_side: float,
+        samples_per_area: float,
+        max_samples: int,
+        bin_width: float,
+        max_lag_multiplier,
+        *,
+        seed: Optional[int] = None
+    ):
         """
-        Calculate the variogram using Numba for performance optimization.
-        Parameters:
-        -----------
-        area_side : float
-            The side length of the area to sample.
-        samples_per_area : int
-            The number of samples to take per area.
-        max_samples : int
-            The maximum number of samples to take.
-        bin_width : float
-            The width of the bins for distance binning.
-        cell_size : float
-            The size of the cell for declustering.
-        n_offsets : int
-            The number of offsets for declustering.
-        max_lag_multiplier : str or float
-            The multiplier for the maximum lag distance. Can be "median", "max", or a float value.
-        normal_transform : bool
-            Whether to apply a normal transformation to the data.
-        weights : bool
-            Whether to apply declustering weights.
-        Returns:
-        --------
-        bin_counts : numpy.ndarray
-            The counts of pairs in each bin.
-        variogram_matheron : numpy.ndarray
-            The calculated variogram values for each bin.
+        Compute one empirical variogram by sampling the raster and binning pairwise
+        squared differences of values by distance.
+
+        Returns
+        -------
+        bin_counts : np.ndarray
+        variogram_matheron : np.ndarray
         n_bins : int
-            The number of bins used.
         min_distance : float
-            The minimum distance considered.
         max_distance : float
-            The maximum distance considered.
+        max_lag : float
         """
-        
-        self.raster_data_handler.sample_raster(area_side, samples_per_area, max_samples)
-        
-        min_distance = 0.0
-        
-        x_extent = self.raster_data_handler.rioxarray_obj.rio.width
-        y_extent = self.raster_data_handler.rioxarray_obj.rio.height
+        self.raster_data_handler.sample_raster(area_side, samples_per_area, max_samples, seed=seed)
 
-        n_bins, bin_counts, binned_sum_squared_diff, max_distance, max_lag = self.bin_distances_and_squared_differences(self.raster_data_handler.coords, self.raster_data_handler.samples, bin_width, max_lag_multiplier, x_extent, y_extent)
-        matheron_estimates = self.compute_matheron(bin_counts, binned_sum_squared_diff, min_pairs=10)
-        
+        min_distance = 0.0  # retained for compatibility
+        xs = self.raster_data_handler.rioxarray_obj.x.values
+        ys = self.raster_data_handler.rioxarray_obj.y.values
+        x_extent = float(np.max(xs) - np.min(xs))
+        y_extent = float(np.max(ys) - np.min(ys))
+
+        n_bins, bin_counts, bssd, max_distance, max_lag = self.bin_distances_and_squared_differences(
+            self.raster_data_handler.coords,
+            self.raster_data_handler.samples,
+            bin_width,
+            max_lag_multiplier,
+            x_extent,
+            y_extent
+        )
+        matheron_estimates = self.compute_matheron(bin_counts, bssd, min_pairs=self.MIN_PAIRS)
         return bin_counts, matheron_estimates, n_bins, min_distance, max_distance, max_lag
-    
-    def calculate_mean_variogram_numba(self,
-                                   area_side,
-                                   samples_per_area,
-                                   max_samples,
-                                   bin_width,
-                                   max_n_bins,
-                                   n_runs,
-                                   max_lag_multiplier=1/3):
-        """
-        Calculate the mean variogram using numba over multiple runs.
-        """
 
-        # Prepare DataFrames to collect per‐run variograms and counts
+    def calculate_mean_variogram_numba(
+        self,
+        area_side: float,
+        samples_per_area: float,
+        max_samples: int,
+        bin_width: float,
+        max_n_bins: int,
+        n_runs: int,
+        max_lag_multiplier=1 / 3,
+        *,
+        seed: Optional[int] = None
+    ) -> None:
+        """
+        Run multiple variogram realizations and compute the mean semivariogram
+        and spread across runs.
+
+        Parameters
+        ----------
+        area_side, samples_per_area, max_samples : see numba_variogram
+        bin_width : float
+        max_n_bins : int
+        n_runs : int
+        max_lag_multiplier : {"max","median"} or float
+        seed : int | None
+            Base seed; each run uses a child seed for reproducibility.
+        """
+        # Child seeds for each run to keep realizations independent but reproducible.
+        ss = np.random.SeedSequence(seed)
+        child_seeds = ss.spawn(n_runs)
+
         all_variograms = pd.DataFrame(np.nan, index=range(n_runs), columns=range(max_n_bins))
-        counts = pd.DataFrame   (np.nan, index=range(n_runs), columns=range(max_n_bins))
-
-        # Track how many bins each run actually produced
+        counts = pd.DataFrame(np.nan, index=range(n_runs), columns=range(max_n_bins))
         all_n_bins = np.zeros(n_runs, dtype=int)
 
         for run in range(n_runs):
             count, variogram, n_bins, _, _, _ = self.numba_variogram(
-                area_side, samples_per_area, max_samples, bin_width, max_lag_multiplier
+                area_side, samples_per_area, max_samples, bin_width, max_lag_multiplier,
+                seed=int(child_seeds[run].generate_state(1)[0])
             )
-            # store semivariances and counts into our tables
-            all_variograms.loc[run, :variogram.size-1] = variogram
-            counts       .loc[run, :count.size-1]     = count
+            all_variograms.loc[run, :variogram.size - 1] = variogram
+            counts.loc[run, :count.size - 1] = count
             all_n_bins[run] = n_bins
 
-        # convert to numpy arrays for ease
-        vario_arr  = all_variograms.values
-        count_arr  = counts.values
+        vario_arr = all_variograms.values
+        count_arr = counts.values
 
-        # compute mean & std, guarding empty‐slice warnings
         with np.errstate(all='ignore'):
             mean_variogram = np.nanmean(vario_arr, axis=0)
-            err_variogram  = (np.nanpercentile(vario_arr, 97.5, axis=0)
-                            -np.nanpercentile(vario_arr,  2.5,axis=0)) / 2.0
-            mean_count     = np.nanmean(count_arr, axis=0)
+            # use robust spread visualization width; stored as err_variogram
+            err_variogram = (np.nanpercentile(vario_arr, 97.5, axis=0) -
+                             np.nanpercentile(vario_arr, 2.5, axis=0)) / 2.0
+            mean_count = np.nanmean(count_arr, axis=0)
             sigma_variogram = np.nanstd(vario_arr, axis=0)
 
-        # replace any zero‐std with a tiny epsilon to avoid division‐by‐zero later
+        
         sigma_filtered = sigma_variogram.copy()
         sigma_filtered[sigma_filtered == 0] = np.finfo(float).eps
 
-        # now drop trailing NaNs so our lags array lines up
         valid = ~np.isnan(mean_variogram)
         self.mean_variogram = mean_variogram[valid]
-        self.err_variogram  = err_variogram[valid]
-        self.mean_count     = mean_count[valid]
-        self.sigma_variogram= sigma_filtered[valid]
+        self.err_variogram = err_variogram[valid]
+        self.mean_count = mean_count[valid]
+        self.sigma_variogram = sigma_filtered[valid]
 
-        # build lags at bin‐centers
         n_kept = self.mean_variogram.size
-        self.lags = np.linspace(bin_width/2,
-                                bin_width*n_kept - bin_width/2,
-                                n_kept)
+        self.lags = np.linspace(bin_width / 2, bin_width * n_kept - bin_width / 2, n_kept)
 
-        # store raw run matrices if you still need them
         self.all_variograms = vario_arr
-        self.all_counts     = count_arr
-        self.n_bins         = int(np.nanmean(all_n_bins))
-    
+        self.all_counts = count_arr
+        self.n_bins = int(np.nanmean(all_n_bins))
+
     @staticmethod
-    def get_base_initial_guess(n, mean_variogram, lags, nugget=False):
-        """Construct a naive initial guess for variogram model parameters.
-
-        For a model with ``n`` spherical components, this helper builds a
-        starting parameter vector by spreading the sills evenly and
-        assigning ranges that increase linearly with the maximum lag.  If
-        a nugget term is requested, an additional parameter is appended.
-
-        Parameters
-        ----------
-        n : int
-            Number of spherical components in the model.
-        mean_variogram : array-like
-            Empirical semivariogram values used to scale the sills.
-        lags : array-like
-            Lag distances corresponding to the empirical semivariogram.
-        nugget : bool, optional
-            Whether to include a nugget parameter at the end of the
-            initial guess vector.
-
-        Returns
-        -------
-        numpy.ndarray
-            A 1-D array containing the initial guesses for the sills,
-            ranges, and optional nugget.
+    def get_base_initial_guess(n: int, mean_variogram, lags, nugget: bool = False) -> np.ndarray:
         """
-        max_semivariance = np.max(mean_variogram)*1.5
+        Naive initial guess: equal sills; ranges spread linearly to max lag; optional nugget (last).
+        """
+        max_semivariance = np.max(mean_variogram) * 1.5
         half_max_lag = np.max(lags) / 2
-        C = [max_semivariance / n]*n      # sills
-        a = [((half_max_lag)/3)*(i+1) for i in range(n)]  # ranges
+        C = [max_semivariance / n] * n
+        a = [((half_max_lag) / 3) * (i + 1) for i in range(n)]
         p0 = C + a + ([max_semivariance / 4] if nugget else [])
-        return np.array(p0)
-    
-    @staticmethod
-    def get_randomized_guesses(base_guess, n_starts=5, perturb_factor=0.3):
-        """
-        Generate multiple initial guesses by perturbing the base guess.
-        'perturb_factor' is a fraction of the base guess values.
-        """
-        p0s = []
-        for _ in range(n_starts):
-            rand_perturbation = (np.random.rand(len(base_guess)) - 0.5) * 2.0
-            # Scale by base_guess * perturb_factor
-            new_guess = base_guess * (1 + rand_perturbation * perturb_factor)
-            # Ensure no negative sills or other invalid guesses
-            new_guess = np.clip(new_guess, 1e-3, None)  
-            p0s.append(new_guess)
-        return p0s
-    
+        return np.array(p0, dtype=float)
+
     @staticmethod
     def pure_nugget_model(h, nugget):
-        """Semivariogram model representing pure nugget variance.
+        """γ(h) for pure nugget: constant variance independent of h."""
+        return np.full_like(h, nugget)
 
-        This model describes a process where there is no spatial
-        correlation and the semivariance is constant for all lag
-        distances ``h``.
+    @staticmethod
+    def spherical_model(h, *params):
+        """
+        Multi-component spherical model without nugget.
 
         Parameters
         ----------
         h : array-like
-            Distances at which to evaluate the model.
-        nugget : float
-            The variance (sill) of the process; this value is
-            returned for all entries of ``h``.
-
-        Returns
-        -------
-        numpy.ndarray
-            An array of the same shape as ``h`` filled with ``nugget``.
-        """
-        return np.full_like(h, nugget)
-    
-    @staticmethod
-    def spherical_model(h, *params):
-        """
-        Computes the spherical model for given distances and parameters.
-
-        The spherical model is commonly used in geostatistics to describe spatial 
-        correlation. It is defined piecewise, with different formulas for distances 
-        less than or equal to the range parameter and for distances greater than the 
-        range parameter.
-
-        Parameters:
-        h (array-like): Array of distances at which to evaluate the model.
-        *params: Variable length argument list containing the sill and range parameters.
-                    The first half of the parameters are the sills (C), and the second half 
-                    are the ranges (a). The number of sills and ranges should be equal.
-
-        Returns:
-        numpy.ndarray: Array of model values corresponding to the input distances.
+        params : [C1..Cn, a1..an] (n sills followed by n ranges)
         """
         n = len(params) // 2
         C = params[:n]
         a = params[n:]
-        model = np.zeros_like(h)
+        model = np.zeros_like(h, dtype=float)
         for i in range(n):
-            mask = h <= a[i]
-            model[mask] += C[i] * (1.5 * (h[mask] / a[i]) - 0.5 * (h[mask] / a[i]) ** 3)
-            #model[mask] += C[i] * (3 * h[mask] / (2 * a[i]) - (h[mask] ** 3) / (2 * a[i] ** 3))
-            model[~mask] += C[i]
+            ai = a[i]
+            Ci = C[i]
+            mask = h <= ai
+            ratio = h[mask] / ai
+            model[mask] += Ci * (1.5 * ratio - 0.5 * ratio ** 3)
+            model[~mask] += Ci
         return model
-        
-    def spherical_model_with_nugget(self,h, nugget, *params):
+
+    def spherical_model_with_nugget(self, h, *params):
         """
-        Computes the spherical model with a nugget effect.
+        Spherical model with nugget at the END of the parameter vector.
 
-        The spherical model is a type of variogram model used in geostatistics.
-        This function adds a nugget effect to the spherical model.
-
-        Parameters:
-        h (array-like): Array of distances at which to evaluate the model.
-        nugget (float): The nugget effect, representing the discontinuity at the origin.
-        *params: Variable length argument list containing the sill and range parameters.
-                    The first half of the parameters are the sills (C), and the second half 
-                    are the ranges (a). The number of sills and ranges should be equal.
-
-        Returns:
-        numpy.ndarray: Array of model values corresponding to the input distances.
+        Parameters
+        ----------
+        params : [C1..Cn, a1..an, nugget]
         """
         nugget = params[-1]
-        # The sills and ranges are all parameters before the last one
-        structural_params = params[:-1]
-        
-        return nugget + self.spherical_model(h, *structural_params)
-        
-    
-    def cross_validate_variogram(self, model_func, p0, bounds, k=5):
+        structural = params[:-1]
+        return nugget + self.spherical_model(h, *structural)
+
+    @staticmethod
+    def bootstrap_fit_variogram(
+        lags: np.ndarray,
+        mean_vario: np.ndarray,
+        sigma_vario: np.ndarray,
+        model_func: Callable,
+        p0: np.ndarray,
+        bounds: Optional[tuple] = None,
+        n_boot: int = 100,
+        maxfev: int = 10000,
+        *,
+        seed: Optional[int] = None
+    ) -> np.ndarray:
         """
-        Perform k-fold cross-validation on the binned variogram data.
-        
-        Returns a dictionary of average fold metrics:
-            - 'rmse'
-            - 'mae'
-            - 'me'  (mean error)
-            - 'mse'
-        
-        If no fold converges, returns None.
+        Parametric bootstrap for parameter uncertainty using per-lag standard deviations.
+
+        Parameters
+        ----------
+        lags, mean_vario, sigma_vario : arrays
+        model_func : callable
+        p0 : initial params
+        bounds : bounds tuple
+        n_boot : int
+        maxfev : int
+        seed : int | None
+
+        Returns
+        -------
+        np.ndarray
+            Successful parameter vectors (rows).
         """
+        rng = np.random.default_rng(seed)
+        # Draw synthetic variograms with Gaussian noise per bin using sigma_vario.
+        noise_array = rng.normal(loc=mean_vario, scale=np.where(sigma_vario > 0, sigma_vario, 0.0), size=(n_boot, len(mean_vario)))
+
+        param_samples = []
+        n_params = len(p0)
+        bnds = bounds if bounds is not None else (-np.inf, np.inf)
+
+        for n in range(n_boot):
+            synth = noise_array[n, :]
+            try:
+                popt_synth, _ = curve_fit(
+                    model_func,
+                    lags,
+                    synth,
+                    p0=p0,
+                    sigma=None,        # Using unconditional fits to the synthetic draws
+                    bounds=bnds,
+                    maxfev=maxfev
+                )
+                param_samples.append(popt_synth)
+            except RuntimeError:
+                param_samples.append([np.nan] * n_params)
+
+        param_samples = np.array(param_samples)
+        valid = ~np.isnan(param_samples).any(axis=1)
+        return param_samples[valid]
+
+    @staticmethod
+    def _weighted_loglike_gaussian(y, yhat, sigma):
+        """
+        Log-likelihood for heteroscedastic Gaussian errors: sum over bins of
+        -0.5 * [log(2π σ_i^2) + ((y_i - ŷ_i)^2 / σ_i^2)]
+        """
+        s = np.asarray(sigma, dtype=float)
+        s = np.where(s <= 0, np.finfo(float).eps, s)
+        resid = y - yhat
+        return -0.5 * np.sum(np.log(2 * np.pi * s ** 2) + (resid ** 2) / (s ** 2))
+
+    def cross_validate_variogram(self, model_func, p0, bounds, k: int = 5, *, seed: Optional[int] = None):
+        """
+        k-fold cross-validation on (lags, mean_variogram) with provided model/bounds.
+
+        Returns
+        -------
+        dict | None
+            {'rmse','mae','me','mse'} averaged across folds, or None if all folds fail.
+        """
+        rng = np.random.default_rng(seed)
         lags = self.lags
         mean_variogram = self.mean_variogram
         sigma_filtered = self.sigma_variogram
-        
-        n_bins = len(lags)
-        indices = np.arange(n_bins)
-        np.random.shuffle(indices)
 
-        fold_size = max(1, n_bins // k)  # in case n_bins < k
-        rmses = []
-        maes = []
-        mes  = []
-        mses = []
+        n_bins = len(lags)
+        indices = rng.permutation(n_bins)
+        fold_size = max(1, n_bins // k)
+        rmses, maes, mes, mses = [], [], [], []
 
         for i in range(k):
-            valid_idx = indices[i*fold_size : (i+1)*fold_size]
+            valid_idx = indices[i * fold_size: (i + 1) * fold_size]
             train_idx = np.setdiff1d(indices, valid_idx)
 
-            # Subset train
             lags_train = lags[train_idx]
             vario_train = mean_variogram[train_idx]
             sigma_train = sigma_filtered[train_idx]
 
-            # Fit on training fold
             try:
-                popt, _ = curve_fit(model_func,
-                                    lags_train, vario_train,
-                                    p0=p0,
-                                    bounds=bounds,
-                                    sigma=sigma_train)
+                popt, _ = curve_fit(model_func, lags_train, vario_train, p0=p0, bounds=bounds, sigma=sigma_train, absolute_sigma=True, maxfev=10000)
             except RuntimeError:
                 continue
 
-            # Predict on validation fold
             lags_valid = lags[valid_idx]
             vario_valid = mean_variogram[valid_idx]
             predictions = model_func(lags_valid, *popt)
 
-            # Compute metrics
             errors = vario_valid - predictions
-            rmse  = np.sqrt(np.mean(errors**2))
-            mae   = np.mean(np.abs(errors))
-            me    = np.mean(errors)
-            mse   = np.mean(errors**2)
+            rmse = float(np.sqrt(np.mean(errors ** 2)))
+            mae = float(np.mean(np.abs(errors)))
+            me = float(np.mean(errors))
+            mse = float(np.mean(errors ** 2))
 
             rmses.append(rmse)
             maes.append(mae)
             mes.append(me)
             mses.append(mse)
 
-        if len(rmses) == 0:
-            return None  # indicates all folds failed to converge
+        if not rmses:
+            return None
 
-        # Average across folds
-        return {
-            'rmse': np.mean(rmses),
-            'mae':  np.mean(maes),
-            'me':   np.mean(mes),
-            'mse':  np.mean(mses)
-        }
-    
-    @staticmethod
-    def bootstrap_fit_variogram(lags, mean_vario,sigma_vario, model_func, p0,
-                            bounds=None, n_boot=100, maxfev=10000):
+        return {'rmse': np.mean(rmses), 'mae': np.mean(maes), 'me': np.mean(mes), 'mse': np.mean(mses)}
+
+    def fit_best_spherical_model(
+        self,
+        sigma_type: str = 'std',
+        bounds: Optional[tuple] = None,
+        method: str = 'trf',
+        *,
+        seed: Optional[int] = None
+    ) -> None:
         """
-        Perform a parametric bootstrap to estimate parameter uncertainties for
-        a variogram model, assuming `err_vario` represents the half-width of 
-        a 95% confidence interval at each lag.
+        Fit spherical variogram models (1–3 components, optional nugget) and select the best by AIC.
 
         Parameters
         ----------
-        lags : np.ndarray
-            Array of lag distances (length m).
-        mean_vario : np.ndarray
-            The mean variogram values across bins (length m).
-        err_vario : np.ndarray 
-            95% confidence interval for each bin (length m).
-        model_func : callable
-            The variogram model (e.g., spherical, exponential, etc.).
-        p0 : np.ndarray
-            An initial guess for the parameters [C1, C2, ..., a1, a2, ..., (nugget?)].
-        bounds : tuple or None
-            (lower_bounds, upper_bounds) for each parameter, if needed by curve_fit.
-        n_boot : int
-            Number of bootstrap replicates.
-        maxfev : int
-            Maximum function evaluations for curve_fit.
+        sigma_type : {'std','linear','exp','sqrt','sq'}
+            Bin weighting scheme used in curve_fit as sigma.
+        bounds : tuple | None
+            Optional (lb, ub) for parameters; if None, internal bounds are used.
+        method : str
+            curve_fit method (default 'trf').
+        seed : int | None
+            RNG seed for randomized initial guesses.
 
-        Returns
-        -------
-        param_samples : np.ndarray
-            Array of shape (n_successful, n_params) with fitted parameters from
-            each bootstrap iteration. Some may fail to converge.
+        Notes
+        -----
+        - Nugget parameter is ALWAYS last in the parameter vector.
         """
-        
-        noise_array = np.zeros((n_boot, len(mean_vario)))
-        rng = np.random.default_rng()
-        for i,(v,s) in enumerate(zip(mean_vario,sigma_vario)):
+        rng = np.random.default_rng(seed)
 
-            noise_temp = rng.normal(loc=v, scale=s, size=n_boot)
-            noise_array[:,i] = noise_temp
-
-        param_samples = []
-        n_params = len(p0)
-
-        for n in range(n_boot):
-
-            # Create synthetic data
-            synthetic_data = noise_array[n,:]
-
-            # Fit the model
-            try:
-                popt_synth, pcov_synth = curve_fit(
-                    model_func,
-                    lags,
-                    synthetic_data,
-                    p0=p0,
-                    sigma=None,  # or pass std_est if you want weighting
-                    bounds=bounds if bounds is not None else (-np.inf, np.inf),
-                    maxfev=maxfev
-                )
-                param_samples.append(popt_synth)
-            except RuntimeError:
-                # If the fit fails, store NaNs for the parameters
-                param_samples.append([np.nan]*n_params)
-
-        param_samples = np.array(param_samples)
-        # Remove any failed fits (NaNs)
-        valid = ~np.isnan(param_samples).any(axis=1)
-        param_samples = param_samples[valid]
-
-        return param_samples
-    
-    def fit_best_spherical_model(self,
-                                 sigma_type: str = 'std',
-                                 bounds: tuple = None,
-                                 method: str = 'trf'):
-        """Fit spherical variogram models and select the best configuration.
-
-        This routine iterates over a set of candidate spherical models
-        (with one to three components and optional nugget terms), fits
-        each to the mean empirical semivariogram, and evaluates their
-        Akaike Information Criterion (AIC).  The model with the lowest
-        AIC is retained and stored along with its fitted parameters.
-
-        Parameters
-        ----------
-        sigma_type : str, optional
-            Determines the weighting applied during curve fitting.
-            ``'std'`` uses the standard deviation of the semivariogram,
-            while other options (``'linear'``, ``'exp'``, ``'sqrt'``,
-            ``'sq'``) apply alternative weighting schemes.
-        bounds : tuple, optional
-            A tuple of lower and upper bounds for the parameters.  If
-            ``None``, bounds are determined internally for each model.
-        method : str, optional
-            Optimization algorithm passed to ``scipy.optimize.curve_fit``.
-            The default ``'trf'`` uses a trust-region method suitable for
-            bounded problems.
-
-        Raises
-        ------
-        RuntimeError
-            If :meth:`calculate_mean_variogram_numba` has not been
-            called prior to model fitting or if no valid model fit is
-            found.
-        """
         if self.all_variograms is None:
             raise RuntimeError("You must call calculate_mean_variogram_numba() before fitting.")
 
@@ -993,12 +769,18 @@ class VariogramAnalysis:
         elif sigma_type == 'sqrt':
             sigma = 1.0 / np.sqrt(1.0 + self.lags)
         elif sigma_type == 'sq':
-            sigma = 1.0 / (1.0 + self.lags**2)
+            sigma = 1.0 / (1.0 + self.lags ** 2)
         else:
             raise ValueError(f"Unknown sigma_type '{sigma_type}'")
 
+        best_params = None
+        best_model = None
+        best_func = None
         best_aic = np.inf
-        best = None
+        best_bounds = None
+        best_guess = None
+
+        lag_max = float(np.max(self.lags)) if self.lags is not None and len(self.lags) else 1.0
         for config in (
             {'components': 1, 'nugget': False},
             {'components': 1, 'nugget': True},
@@ -1011,40 +793,52 @@ class VariogramAnalysis:
             nugget = config['nugget']
             if n == 0:
                 model = self.pure_nugget_model
-                lower_bounds, upper_bounds = [0], [np.inf]
+                auto_bounds = ([0.0], [np.inf])
                 p0s = [np.array([np.max(self.mean_variogram)])]
             else:
                 model = self.spherical_model_with_nugget if nugget else self.spherical_model
-                lower_bounds = [0]*n + [1]*n + ([0] if nugget else [])
-                upper_bounds = [np.inf]*n + [np.max(self.lags)]*n + ([np.inf] if nugget else [])
-                p0s = self.get_randomized_guesses(
-                    self.get_base_initial_guess(n, self.mean_variogram, self.lags, nugget),
-                    n_starts=5,
-                    perturb_factor=0.5
-                )
-            bounds_tuple = (lower_bounds, upper_bounds)
-            
+                
+                lb = [0.0] * n + [1e-6] * n + ([0.0] if nugget else [])
+                ub = [np.inf] * n + [2.0 * lag_max] * n + ([np.inf] if nugget else [])
+                auto_bounds = (lb, ub)
+
+                base = self.get_base_initial_guess(n, self.mean_variogram, self.lags, nugget)
+                p0s = []
+                for _ in range(5):
+                    perturb = (rng.random(len(base)) - 0.5) * 2.0 * 0.5  # +/-50%
+                    guess = np.clip(base * (1 + perturb), 1e-6, None)
+                    p0s.append(guess)
+
+            bounds_tuple = bounds if bounds is not None else auto_bounds
+
             for p0 in p0s:
                 try:
                     popt, _ = curve_fit(
-                        model, self.lags, self.mean_variogram,
-                        p0=p0, sigma=sigma, bounds=bounds_tuple,
-                        method=method, maxfev=10000
+                        model,
+                        self.lags,
+                        self.mean_variogram,
+                        p0=p0,
+                        sigma=sigma,
+                        absolute_sigma=True,  
+                        bounds=bounds_tuple,
+                        method=method,
+                        maxfev=20000
                     )
                 except RuntimeError:
                     continue
 
-                # AIC
-                resid = self.mean_variogram - model(self.lags, *popt)
-                s2 = np.var(resid)
-                ll = -0.5*len(resid)*(np.log(2*np.pi*s2)+1)
-                aic = 2*len(popt) - 2*ll
+                yhat = model(self.lags, *popt)
+                ll = self._weighted_loglike_gaussian(self.mean_variogram, yhat, sigma)
+                k = len(popt)
+                aic = 2 * k - 2 * ll
 
                 if aic < best_aic:
                     best_aic = aic
                     best_params = popt
                     best_model = config
                     best_func = model
+                    best_bounds = bounds_tuple
+                    best_guess = p0
 
         if best_params is None:
             raise RuntimeError("No valid model fit found.")
@@ -1053,69 +847,70 @@ class VariogramAnalysis:
         self.best_model_config = best_model
         self.best_model_func = best_func
         self.best_aic = best_aic
+        self.best_bounds = best_bounds
+        self.best_guess = best_guess
         self.fitted_variogram = (
             self.spherical_model_with_nugget if self.best_model_config['nugget']
             else self.spherical_model
         )(self.lags, *self.best_params)
-        
 
-    # extract sill & range point estimates
+        # Extract sill & range point estimates; nugget last if present
         n = self.best_model_config['components']
-        nug = self.best_model_config['nugget']
-        if n == 0:
-            bounds_boot = ([0], [np.inf])
-        else:
-            # sill bounds = [0]*n, range bounds = [1]*n, optional nugget bound = [0]
-            lb = [0]*n + [1]*n + ([0] if nug else [])
-            ub = [np.inf]*n + [np.max(self.lags)]*n + ([np.inf] if nug else [])
-            bounds_boot = (lb, ub)
-        
         if self.best_model_config['nugget']:
-            # [nug,C1..Cn,a1..an]
-            self.sills  = self.best_params[1:1+n]
-            self.ranges = self.best_params[1+n:1+2*n]
+            self.sills = self.best_params[:n]
+            self.ranges = self.best_params[n:2 * n]
+            self.best_nugget = float(self.best_params[-1])
         else:
-            # [C1..Cn,a1..an]
-            self.sills  = self.best_params[:n]
-            self.ranges = self.best_params[n:2*n]
+            self.sills = self.best_params[:n]
+            self.ranges = self.best_params[n:2 * n]
+            self.best_nugget = None
 
-        # parametric bootstrap
+        # Prepare bounds for bootstrap consistent with nugget-last convention
+        if n == 0:
+            bounds_boot = ([0.0], [np.inf])
+        else:
+            lb = [0.0] * n + [1e-6] * n + ([0.0] if self.best_model_config['nugget'] else [])
+            ub = [np.inf] * n + [2.0 * lag_max] * n + ([np.inf] if self.best_model_config['nugget'] else [])
+            bounds_boot = (lb, ub)
+
+        # Parametric bootstrap using per-bin sigma (std across runs)
         samples = self.bootstrap_fit_variogram(
             self.lags,
             self.mean_variogram,
-            self.err_variogram,
+            self.sigma_variogram,  
             self.best_model_func,
             self.best_params,
             bounds=bounds_boot,
             n_boot=500,
-            maxfev=10000
+            maxfev=20000,
+            seed=seed,
         )
+        self.param_samples = samples
 
-        # if any succeeded, compute percentiles
+        # Percentiles of parameters
         if samples.size:
-            # drop nugget column if present
             if self.best_model_config['nugget']:
-                nug_samps = samples[:,0]
-                samp = samples[:,1:]
+                nug_samps = samples[:, -1]
+                samp = samples[:, :-1]
             else:
                 nug_samps = None
                 samp = samples
 
-            sill_samps  = samp[:,:n]
-            range_samps = samp[:,n:2*n]
+            sill_samps = samp[:, :n]
+            range_samps = samp[:, n:2 * n]
 
-            self.sills_min    = np.percentile(sill_samps,  16, axis=0)
-            self.sills_max    = np.percentile(sill_samps, 84, axis=0)
-            self.sills_median = np.percentile(sill_samps, 50,   axis=0)
+            self.sills_min = np.percentile(sill_samps, 16, axis=0)
+            self.sills_max = np.percentile(sill_samps, 84, axis=0)
+            self.sills_median = np.percentile(sill_samps, 50, axis=0)
 
-            self.ranges_min    = np.percentile(range_samps,  16, axis=0)
-            self.ranges_max    = np.percentile(range_samps, 84, axis=0)
-            self.ranges_median = np.percentile(range_samps, 50,   axis=0)
+            self.ranges_min = np.percentile(range_samps, 16, axis=0)
+            self.ranges_max = np.percentile(range_samps, 84, axis=0)
+            self.ranges_median = np.percentile(range_samps, 50, axis=0)
 
             if nug_samps is not None:
-                self.min_nugget    = np.percentile(nug_samps,  16)
-                self.max_nugget    = np.percentile(nug_samps, 84)
-                self.median_nugget = np.percentile(nug_samps, 50)
+                self.min_nugget = float(np.percentile(nug_samps, 16))
+                self.max_nugget = float(np.percentile(nug_samps, 84))
+                self.median_nugget = float(np.percentile(nug_samps, 50))
             else:
                 self.min_nugget = self.max_nugget = self.median_nugget = None
         else:
@@ -1126,561 +921,381 @@ class VariogramAnalysis:
                 self.min_nugget = self.max_nugget = self.median_nugget = self.best_nugget
             else:
                 self.min_nugget = self.max_nugget = self.median_nugget = None
-    
+
+        # Compute and store cross-validation metrics on best model
+        self.cv_mean_error_best_aic = self.cross_validate_variogram(
+            self.best_model_func, self.best_params, self.best_bounds, k=5, seed=seed
+        )
+
     def plot_best_spherical_model(self):
         """
-        Plots the best spherical model for the variogram analysis.
-        This function generates a two-panel plot:
-        - The top panel displays a histogram of semivariance counts.
-        - The bottom panel shows the mean variogram with error bars, the fitted model,
-          vertical lines at each range ± its error, and the nugget effect if applicable.
-        The bottom title shows the RMSE from cross-validation.
-        Returns:
-            fig (matplotlib.figure.Figure): The figure object containing the plot.
+        Plot mean variogram ± spread and fitted model; also show bar plot of mean pair counts.
         """
-        # ensure everything is available
-        if any(attr is None for attr in (self.mean_variogram,
-                                         self.err_variogram,
-                                         self.mean_count,
-                                         self.lags,
-                                         self.fitted_variogram)):
+        if any(attr is None for attr in (self.mean_variogram, self.err_variogram, self.mean_count, self.lags, self.fitted_variogram)):
             raise RuntimeError("Must run calculate_mean_variogram_numba() and fit_best_spherical_model() first.")
 
-        # truncate to common valid length
-        n = min(len(self.lags),
-                len(self.mean_variogram),
-                len(self.err_variogram),
-                len(self.fitted_variogram))
-        lags   = self.lags[:n]
-        gamma  = self.mean_variogram[:n]
-        errs   = self.err_variogram[:n]
-        model  = self.fitted_variogram[:n]
+        n = min(len(self.lags), len(self.mean_variogram), len(self.err_variogram), len(self.fitted_variogram))
+        lags = self.lags[:n]
+        gamma = self.mean_variogram[:n]
+        errs = self.err_variogram[:n]
+        model = self.fitted_variogram[:n]
         counts = self.mean_count[:n]
 
-        # drop any bins with zero or NaN counts
         valid_counts = (~np.isnan(counts)) & (counts > 0)
-        count_lags   = lags[valid_counts]
-        count_vals   = counts[valid_counts]
+        count_lags = lags[valid_counts]
+        count_vals = counts[valid_counts]
 
-        # build figure
-        fig, axs = plt.subplots(2, 1, 
-                                gridspec_kw={'height_ratios': [1, 3]},
-                                figsize=(10, 8),
-                                sharex=True)
+        fig, axs = plt.subplots(2, 1, gridspec_kw={'height_ratios': [1, 3]}, figsize=(10, 8), sharex=True)
 
-        # ─── top: histogram of mean pair-counts ────────────────────────────────
-        bar_width = (lags[1] - lags[0]) * 0.9
-        axs[0].bar(count_lags, count_vals, width=bar_width,
-                   color='orange', alpha=0.5)
+        # guard single-bin bar width
+        if len(lags) > 1:
+            bar_width = (lags[1] - lags[0]) * 0.9
+        else:
+            bar_width = (lags[0] if len(lags) else 1.0) * 0.9
+        axs[0].bar(count_lags, count_vals, width=bar_width, color='orange', alpha=0.5)
         axs[0].set_ylabel('Mean Count')
         axs[0].tick_params(labelbottom=False)
 
-        # ─── bottom: variogram & model ────────────────────────────────────────
-        axs[1].errorbar(lags, gamma, yerr=errs, fmt='o-', 
-                        color='blue', label='Mean Variogram ± spread')
+        axs[1].errorbar(lags, gamma, yerr=errs, fmt='o-', color='blue', label='Mean Variogram ± spread')
         axs[1].plot(lags, model, 'r-', label='Fitted Model')
 
-        # draw range lines ± error
-        colors = ['red','green','blue']
-        if self.ranges is not None and \
-           self.ranges_min is not None and \
-           self.ranges_max is not None:
+        colors = ['red', 'green', 'blue']
+        if self.ranges is not None and self.ranges_min is not None and self.ranges_max is not None:
             ylim = axs[1].get_ylim()
-            for i,(r, rmin, rmax) in enumerate(zip(self.ranges,
-                                                   self.ranges_min,
-                                                   self.ranges_max)):
+            for i, (r, rmin, rmax) in enumerate(zip(self.ranges, self.ranges_min, self.ranges_max)):
                 c = colors[i % len(colors)]
-                axs[1].axvline(r, color=c, linestyle='--', linewidth=1,
-                               label=f'Range {i+1}')
-                axs[1].fill_betweenx(ylim, rmin, rmax,
-                                     color=c, alpha=0.2)
+                axs[1].axvline(r, color=c, linestyle='--', linewidth=1, label=f'Range {i + 1}')
+                axs[1].fill_betweenx(ylim, rmin, rmax, color=c, alpha=0.2)
 
-        # draw nugget ± error
-        if self.best_nugget is not None and \
-           self.min_nugget is not None and \
-           self.max_nugget is not None:
-            axs[1].axhline(self.best_nugget, color='black',
-                           linestyle='--', linewidth=1,
-                           label='Nugget')
-            axs[1].fill_between(lags, 
-                                [self.min_nugget]*n, 
-                                [self.max_nugget]*n,
-                                color='gray', alpha=0.2)
+        if self.best_nugget is not None and self.min_nugget is not None and self.max_nugget is not None:
+            axs[1].axhline(self.best_nugget, color='black', linestyle='--', linewidth=1, label='Nugget')
+            axs[1].fill_between(lags, [self.min_nugget] * len(lags), [self.max_nugget] * len(lags), color='gray', alpha=0.2)
 
         axs[1].set_xlabel('Lag Distance')
         axs[1].set_ylabel('Semivariance')
         axs[1].legend(loc='upper right')
 
-        # show RMSE in title if available
         rmse_str = ""
         if isinstance(self.cv_mean_error_best_aic, dict):
             rmse = self.cv_mean_error_best_aic.get('rmse', None)
             if rmse is not None:
-                rmse_str = f'RMSE: {rmse:.4f}'
+                rmse_str = f'RMSE (CV): {rmse:.4f}'
         axs[1].set_title(rmse_str)
-
         plt.setp(axs[0].get_xticklabels(), visible=False)
         plt.tight_layout()
         return fig
 
+
 class RegionalUncertaintyEstimator:
-    # (unchanged __init__ and helper methods before estimate_monte_carlo_raster)
     """
-    Estimate the regional uncertainty (standard deviation σ_A) for a given area (polygon)
-    using multiple methods. The regional uncertainty is defined by the formula:
-    
-        σ_A^2 = (1 / A^2) ∬_A [σ_Δz^2 – γ(h)] dx dy,
-    
-    where A is the area of the polygon, σ_Δz^2 is the variance (sill) of elevation differences (a constant),
-    and γ(h) is the semivariogram function giving the variance of differences at separation distance h.
-    
-    This class implements four methods to compute σ_A:
-    
-    1. **Analytical (Approximate):** Uses a theoretical approximation (e.g., treating the area as an 
-       equivalent circle of the same area) to integrate the variogram analytically or semi-analytically.
-    2. **Brute-force Numerical:** Performs a numerical double integration by discretizing the area 
-       into a fine grid of points and summing contributions of all pairs of points.
-    3. **Monte Carlo:** Estimates the double integral via random sampling of point pairs in the polygon.
-    4. **FFT Convolution:** Uses Fast Fourier Transform convolution/correlation to efficiently compute 
-       the double integral over the area by leveraging the convolution theorem.
-    
-    Each method returns the regional uncertainty σ_A (the standard deviation) for the area.
-    
-    **Parameters:**
-    - `polygon`: The polygonal area of interest, defined as a GeoJSON dictionary/string or a Shapely Polygon/MultiPolygon. 
-       Arbitrary polygonal shapes (including those with holes or multiple parts) are supported. 
-       If a GeoJSON is provided, it will be converted to a Shapely geometry.
-    - `gamma_func`: A callable function `gamma_func(h)` that returns the semivariogram γ(h) for a given 
-       separation distance h. This models spatial correlation (γ(0) should be 0, and γ(h) approaches σ_Δz^2 as h increases to the range).
-    - `sigma2_delta_z`: The fixed variance σ_Δz^2 (sill) corresponding to the semivariogram. This is the variance of differences 
-       at zero separation (the total variance of the process). For a covariance model C(h), C(h) = σ_Δz^2 – γ(h).
-    
-    **Coordinate Units:** The polygon coordinates and the variogram function’s distance units must be consistent (e.g., both in meters). 
-    If the polygon is provided in geographic coordinates (lat/long), it should be projected to a planar coordinate system 
-    for meaningful distance calculations.
+    Estimate regional uncertainty σ_A over a polygon using several methods:
+
+      analytical  : equivalent-disk radial integration of covariance
+      brute_force : grid double sum (validation)
+      monte_carlo : plain Monte Carlo on independent pairs; supports heteroscedastic σ(x,y)
+      fft         : FFT-based autocorrelation of polygon mask with covariance map
+      hugonnet    : K-center shortcut (Hugonnet et al., 2022)
+      raster      : Monte Carlo over raster-valid footprint or bounding box
+
+    Assumes isotropic semivariogram model.
     """
-    # ─── static helpers ─────────────────────────────────────────────────
+
     @staticmethod
-    def arrange_params(*, sills, ranges, nugget=None):
+    def _as_multipolygon(geom):
+        if isinstance(geom, MultiPolygon):
+            return geom
+        if isinstance(geom, Polygon):
+            return MultiPolygon([geom])
+        raise TypeError("geom must be a shapely Polygon or MultiPolygon")
+
+    class _UniformMultiPolygonSampler:
+        def __init__(self, mp, rng=None):
+            self.rng = np.random.default_rng(rng)
+            self.polys = list(mp.geoms)
+            self.prepared = [prep(p) for p in self.polys]
+            self.areas = np.array([p.area for p in self.polys], dtype=float)
+            if not np.all(np.isfinite(self.areas)) or self.areas.sum() <= 0:
+                raise ValueError("Invalid polygon areas.")
+            self.probs = self.areas / self.areas.sum()
+
+        def _sample_in_polygon(self, poly, n, P=None):
+            P = P or prep(poly)
+            minx, miny, maxx, maxy = poly.bounds
+            out = []
+            batch = max(256, int(1.5 * n))
+            while len(out) < n:
+                xs = self.rng.uniform(minx, maxx, size=batch)
+                ys = self.rng.uniform(miny, maxy, size=batch)
+                for x, y in zip(xs, ys):
+                    if P.contains(Point(float(x), float(y))):
+                        out.append((float(x), float(y)))
+                        if len(out) >= n:
+                            break
+            return np.asarray(out, dtype=float)
+
+        def sample(self, n):
+            idx = self.rng.choice(len(self.polys), size=n, replace=True, p=self.probs)
+            counts = np.bincount(idx, minlength=len(self.polys))
+            chunks = []
+            for k, c in enumerate(counts):
+                if c > 0:
+                    chunks.append(self._sample_in_polygon(self.polys[k], int(c), self.prepared[k]))
+            if not chunks:
+                return np.empty((0, 2), dtype=float)
+            pts = np.vstack(chunks)
+            self.rng.shuffle(pts, axis=0)
+            return pts
+
+    @staticmethod
+    def _cov_from_gamma(gamma_func, sigma2_total):
+        """Return covariance C(h) = σ²_total − γ(h) as a vectorized callable."""
+        def cov(h):
+            h = np.asarray(h, dtype=float)
+            return sigma2_total - gamma_func(h)
+        return cov
+
+    @staticmethod
+    def arrange_params(*, sills: Sequence[float], ranges: Sequence[float], nugget: Optional[float] = None):
         """
-        Build a flat parameter list to feed the fitted variogram model.
-        Returns (params1, params2, params3, all_params) where each paramsX
-        corresponds to one of the spherical components (None if not needed).
+        Build parameter lists for a fitted variogram model.
+
+        Returns
+        -------
+        (params1, params2, params3, all_params)
+            Where each paramsX is [C, a, nugget] for a single component (or None),
+            and all_params is [C1..Cn, a1..an, (nugget?)].
         """
         if len(sills) != len(ranges):
             raise ValueError("sills and ranges must have the same length")
-
-        all_params = []
-        param_sets = []
-        all_sills = []
-        all_ranges = []
-
-        for C, a in zip(sills, ranges):
-            p = [C, a]
-            param_sets.append(p)
-            all_sills.append(C)
-            all_ranges.append(a)
-        all_params = all_sills + all_ranges
-
+        all_params = list(sills) + list(ranges)
+        
         if nugget is not None:
-            all_params  = [nugget] + all_params
-            param_sets  = [[nugget] + p for p in param_sets]
+            all_params = all_params + [nugget]
 
-        # pad with None so we always return 3 items
+        param_sets = [[C, a] for C, a in zip(sills, ranges)]
+        if nugget is not None:
+            param_sets = [ps + [nugget] for ps in param_sets]
         while len(param_sets) < 3:
             param_sets.append(None)
-
         return (*param_sets, all_params)
 
     @staticmethod
     def bind_gamma(model_func, params):
-        """Return γ(h) with parameters ‘params’ baked in (or None)."""
+        """Return γ(h) with parameters baked in (or None)."""
         if params is None:
             return None
-        else:
-            
-            return lambda h: model_func(np.asarray(h, dtype=float), *params)
-    
-    
-    def __init__(self, raster_data_handler, variogram_analysis, area_of_interest):
-        """Prepare a regional uncertainty estimator for a given area.
+        return lambda h: model_func(np.asarray(h, dtype=float), *params)
 
-        Parameters
-        ----------
-        raster_data_handler : RasterDataHandler
-            The data handler providing access to the underlying raster and its
-            properties.
-        variogram_analysis : VariogramAnalysis
-            An instance with a fitted variogram model whose parameters
-            (sills, ranges, nugget) will be used for uncertainty propagation.
-        area_of_interest : str | Path | shapely.geometry.Polygon | shapely.geometry.MultiPolygon
-            The spatial region over which to compute the mean uncertainty.  This
-            may be supplied as a file path to a vector file (shapefile, GeoJSON,
-            etc.), a ``Polygon`` or ``MultiPolygon``.  The geometry is
-            dissolved into a single polygon internally.
-
-        Raises
-        ------
-        ValueError
-            If no geometries are found in a provided file or the resulting
-            polygon is invalid.
-        TypeError
-            If the ``area_of_interest`` argument is of an unsupported type.
-        """
-
-        polygon = None
+    def __init__(self, raster_data_handler: RasterDataHandler, variogram_analysis: VariogramAnalysis, area_of_interest):
+        # Resolve polygon
         if isinstance(area_of_interest, (str, Path)):
-            # Handle file path input using geopandas
             gdf = gpd.read_file(area_of_interest)
             if gdf.empty:
                 raise ValueError(f"No geometries found in file: {area_of_interest}")
-            # Combine all geometries from the file into a single one
             polygon = gdf.unary_union
         elif isinstance(area_of_interest, (Polygon, MultiPolygon)):
-            # Handle direct shapely geometry input
             polygon = area_of_interest
         else:
-            raise TypeError(
-                "area_of_interest must be a file path (str or Path) or a shapely Polygon/MultiPolygon."
-            )
+            raise TypeError("area_of_interest must be a path or a shapely Polygon/MultiPolygon.")
 
-        # Ensure the final geometry is a single valid Polygon
         if isinstance(polygon, MultiPolygon):
-            polygon = polygon.union()
+            polygon = unary_union(polygon)
         if not isinstance(polygon, Polygon) or polygon.is_empty or polygon.area <= 0:
-            raise ValueError("Input must resolve to a single, valid Polygon with a non-zero area.")
+            raise ValueError("Input must resolve to a single, valid Polygon with non-zero area.")
 
         self.raster_data_handler = raster_data_handler
         self.variogram_analysis = variogram_analysis
-        self.params = self.variogram_analysis.best_params
         self.polygon = polygon
         self.area = polygon.area
-        self.sigma2 = (self.variogram_analysis.best_nugget or 0) +sum(self.variogram_analysis.sills)# σ_Δz^2 (sill variance)
-        self.sigma2_min = (self.variogram_analysis.min_nugget or 0) + sum(self.variogram_analysis.sills_min)
-        self.sigma2_max = (self.variogram_analysis.max_nugget or 0) + sum(self.variogram_analysis.sills_max)
-        self.sills = self.variogram_analysis.sills
-        self.sills_min = self.variogram_analysis.sills_min
-        self.sills_max = self.variogram_analysis.sills_max
-        self.ranges = self.variogram_analysis.ranges
-        self.ranges_min = self.variogram_analysis.ranges_min
-        self.ranges_max = self.variogram_analysis.ranges_max
-        self.nugget = self.variogram_analysis.best_nugget
-    
-        self.best_model_config = self.variogram_analysis.best_model_config
-        self.best_model_func = self.variogram_analysis.best_model_func
-        
-        # arrange parameters
-        p1, p2, p3, p_tot = self.arrange_params(
-            sills   = self.sills,
-            ranges  = self.ranges,
-            nugget  = self.nugget,
-        )
 
-        # store ready-to-use γ(h) callables
+        # Variogram pieces
+        self.sills = variogram_analysis.sills
+        self.ranges = variogram_analysis.ranges
+        self.nugget = variogram_analysis.best_nugget
+        self.sills_min = variogram_analysis.sills_min
+        self.sills_max = variogram_analysis.sills_max
+        self.ranges_min = variogram_analysis.ranges_min
+        self.ranges_max = variogram_analysis.ranges_max
+
+        # Total sill (variance)
+        self.sigma2 = (self.nugget or 0.0) + float(sum(self.sills))
+        self.sigma2_min = (variogram_analysis.min_nugget or 0.0) + float(sum(self.sills_min))
+        self.sigma2_max = (variogram_analysis.max_nugget or 0.0) + float(sum(self.sills_max))
+
+        # γ(h) callables
+        p1, p2, p3, p_tot = self.arrange_params(sills=self.sills, ranges=self.ranges, nugget=self.nugget)
         self.gamma_func_total = self.bind_gamma(variogram_analysis.best_model_func, p_tot)
-        self.gamma_func_1     = self.bind_gamma(variogram_analysis.best_model_func, p1)
-        self.gamma_func_2     = self.bind_gamma(variogram_analysis.best_model_func, p2)
-        self.gamma_func_3     = self.bind_gamma(variogram_analysis.best_model_func, p3)
+        self.gamma_func_1 = self.bind_gamma(variogram_analysis.best_model_func, p1)
+        self.gamma_func_2 = self.bind_gamma(variogram_analysis.best_model_func, p2)
+        self.gamma_func_3 = self.bind_gamma(variogram_analysis.best_model_func, p3)
 
-        # and the min/max envelopes
         p1_min, p2_min, p3_min, p_tot_min = self.arrange_params(
-            sills   = variogram_analysis.sills_min,
-            ranges  = variogram_analysis.ranges_min,
-            nugget  = variogram_analysis.min_nugget,
+            sills=variogram_analysis.sills_min, ranges=variogram_analysis.ranges_min, nugget=variogram_analysis.min_nugget
+        )
+        p1_max, p2_max, p3_max, p_tot_max = self.arrange_params(
+            sills=variogram_analysis.sills_max, ranges=variogram_analysis.ranges_max, nugget=variogram_analysis.max_nugget
         )
         self.gamma_func_total_min = self.bind_gamma(variogram_analysis.best_model_func, p_tot_min)
-        self.gamma_func_1_min     = self.bind_gamma(variogram_analysis.best_model_func, p1_min)
-        self.gamma_func_2_min     = self.bind_gamma(variogram_analysis.best_model_func, p2_min)
-        self.gamma_func_3_min     = self.bind_gamma(variogram_analysis.best_model_func, p3_min)
-        
-        p1_max, p2_max, p3_max, p_tot_max = self.arrange_params(
-            sills   = variogram_analysis.sills_max,
-            ranges  = variogram_analysis.ranges_max,
-            nugget  = variogram_analysis.max_nugget,
-        )
         self.gamma_func_total_max = self.bind_gamma(variogram_analysis.best_model_func, p_tot_max)
-        self.gamma_func_1_max     = self.bind_gamma(variogram_analysis.best_model_func, p1_max)
-        self.gamma_func_2_max     = self.bind_gamma(variogram_analysis.best_model_func, p2_max)
-        self.gamma_func_3_max     = self.bind_gamma(variogram_analysis.best_model_func, p3_max)
-        
-        self.mean_random_correlated_1_max_polygon = None
-        self.mean_random_correlated_2_max_polygon = None
-        self.mean_random_correlated_3_max_polygon = None
-        self.total_mean_correlated_uncertainty_polygon = None    
-        self.mean_random_correlated_1_min_polygon = None
-        self.mean_random_correlated_2_min_polygon = None    
-        self.mean_random_correlated_3_min_polygon = None
-        self.total_mean_correlated_uncertainty_min_polygon = None
-        self.mean_random_correlated_1_polygon = None
-        self.mean_random_correlated_2_polygon = None
-        self.mean_random_correlated_3_polygon = None
-        self.total_mean_correlated_uncertainty_max_polygon = None
-        
-        self.mean_random_correlated_1_raster = None
-        self.mean_random_correlated_2_raster = None
-        self.mean_random_correlated_3_raster = None
-        self.total_mean_correlated_uncertainty_raster = None
-        self.mean_random_correlated_1_min_raster = None
-        self.mean_random_correlated_2_min_raster = None
-        self.mean_random_correlated_3_min_raster = None
-        self.total_mean_correlated_uncertainty_min_raster = None
-        self.mean_random_correlated_1_max_raster = None
-        self.mean_random_correlated_2_max_raster = None
-        self.mean_random_correlated_3_max_raster = None
-        self.total_mean_correlated_uncertainty_max_raster = None
-        
+        self.gamma_func_1_min = self.bind_gamma(variogram_analysis.best_model_func, p1_min)
+        self.gamma_func_1_max = self.bind_gamma(variogram_analysis.best_model_func, p1_max)
+        self.gamma_func_2_min = self.bind_gamma(variogram_analysis.best_model_func, p2_min)
+        self.gamma_func_2_max = self.bind_gamma(variogram_analysis.best_model_func, p2_max)
+        self.gamma_func_3_min = self.bind_gamma(variogram_analysis.best_model_func, p3_min)
+        self.gamma_func_3_max = self.bind_gamma(variogram_analysis.best_model_func, p3_max)
+
+        # Storage for results
         self.mean_random_uncorrelated = None
-        
+        self.total_mean_correlated_uncertainty_polygon = None
+        self.total_mean_correlated_uncertainty_min_polygon = None
+        self.total_mean_correlated_uncertainty_max_polygon = None
+
+        self.total_mean_correlated_uncertainty_raster = None
+
         self.total_mean_uncertainty_polygon = None
-        self.total_mean_uncertainty_raster = None
         self.total_mean_uncertainty_min_polygon = None
-        self.total_mean_uncertainty_min_raster = None
         self.total_mean_uncertainty_max_polygon = None
+        self.total_mean_uncertainty_raster = None
+        self.total_mean_uncertainty_min_raster = None
         self.total_mean_uncertainty_max_raster = None
-        
-    def estimate(self, func, method="analytical", **kwargs):
-        """
-        Estimate the regional uncertainty σ_A using the specified method.
-        
-        Parameters:
-        - `method` (str): One of {"analytical", "brute_force", "monte_carlo", "fft"} (not case-sensitive).
-        - `**kwargs`: Additional arguments specific to each method:
-            * For `"analytical"`: `num_steps` (int, optional) – number of steps for radial integration.
-            * For `"brute_force"`: `resolution` (float, optional) – grid cell size for discretization; or 
-                                     `grid_points` (int, optional) – approximate number of grid cells along the longest polygon dimension.
-            * For `"monte_carlo"`: `n_pairs` (int, optional) – number of random point pairs to sample.
-            * For `"fft"`: `cell_size` (float, optional) – grid cell size for rasterization; or 
-                            `grid_points` (int, optional) – number of cells along longest dimension if cell_size not provided.
-        
-        Returns:
-        - `sigma_A` (float): The regional uncertainty (standard deviation) estimated by the chosen method.
-        """
+
+        for comp in (1, 2, 3):
+            for scope in ("polygon", "raster"):
+                setattr(self, f"mean_random_correlated_{comp}_{scope}", None)
+                setattr(self, f"mean_random_correlated_{comp}_min_{scope}", None)
+                setattr(self, f"mean_random_correlated_{comp}_max_{scope}", None)
+
+    def estimate(self, func, method: str = "analytical", **kwargs):
         method = method.lower()
         if method in ("analytical", "analytic"):
             return self.estimate_analytical(func, **kwargs)
-        elif method in ("brute_force", "numerical"):
-            return self.estimate_brute_force(func,**kwargs)
-        elif method in ("monte_carlo", "montecarlo"):
-            return self.estimate_monte_carlo(func,**kwargs)
-        elif method in ("fft", "convolution"):
-            return self.estimate_fft(func,**kwargs)
-        elif method in ("hug", "hugonnet"):
-            return self.estimate_hugonnet(func,**kwargs)
-        elif method in ("raster"):
-            return self.estimate_monte_carlo_raster(func,**kwargs)
-        else:
-            raise ValueError(f"Unknown method '{method}'. Valid options are 'analytical', 'brute_force', 'monte_carlo', or 'fft'.")
+        if method in ("brute_force", "numerical"):
+            return self.estimate_brute_force(func, **kwargs)
+        if method in ("monte_carlo", "montecarlo"):
+            return self.estimate_monte_carlo(func, **kwargs)
+        if method in ("fft", "convolution"):
+            return self.estimate_fft(func, **kwargs)
+        if method in ("hug", "hugonnet"):
+            return self.estimate_hugonnet(func, **kwargs)
+        if method == "raster":
+            return self.estimate_monte_carlo_raster(func, **kwargs)
+        raise ValueError("Unknown method.")
 
-    def estimate_analytical(self,gamma_func, num_steps=1000):
+    def estimate_analytical(self, gamma_func: Callable[[np.ndarray], np.ndarray], num_steps: int = 1000) -> float:
         """
-        Analytical (approximate) method for σ_A.
-        
-        Approximates the double integral by treating the area as an equivalent circle of the same area (Rolstad et al., 2009 approach). 
-        The semivariogram is integrated radially from the center of this circle.
-        
-        **Note:** This method provides a fast closed-form or semi-analytical approximation, but it may overestimate σ_A for elongated 
-        or irregular shapes (the disk approximation is conservative, as it assumes all points are as close as possible on average).
-        
-        Parameters:
-        - `num_steps` (int): The number of radial steps for numerical integration (higher = more accurate integration of γ(h)).
-        
-        Returns:
-        - `sigma_A` (float): The regional uncertainty (standard deviation) approximated analytically.
+        Equivalent-disk analytical integration of covariance:
+        σ_A² = (2π / A) ∫₀ᴿ r [σ² − γ(r)] dr, where R = sqrt(A/π)
         """
-        
-    
-        # --- geometry ---------------------------------------------------------
-        R   = math.sqrt(self.area / math.pi)         # radius of equivalent disk
-        dr  = R / num_steps
-
-        # --- radial integral of the covariance -------------------------------
-        #     I = ∫0^R r [σ² − γ(r)] dr   (mid-point rule)
+        R = math.sqrt(self.area / math.pi)
+        dr = R / num_steps
         r_mid = (np.arange(num_steps) + 0.5) * dr
-        cov   = self.sigma2 - gamma_func(r_mid)
-        I     = np.sum(r_mid * cov) * dr            #  ∫ r C(r) dr
-
-        # --- convert to σ_A² --------------------------------------------------
-        sigma2_A = (2 * math.pi / self.area) * I    # Eq. above
-
+        cov = self.sigma2 - gamma_func(r_mid)
+        I = float(np.sum(r_mid * cov) * dr)
+        sigma2_A = (2.0 * math.pi / self.area) * I
         return math.sqrt(max(sigma2_A, 0.0))
-    
-    def estimate_brute_force(self, gamma_func, resolution=None, grid_points=100):
+
+    def estimate_brute_force(self, gamma_func: Callable[[np.ndarray], np.ndarray], resolution: Optional[float] = None, grid_points: int = 100) -> float:
         """
-        Brute-force numerical integration of σ_A.
-        
-        Discretizes the polygon area into a grid of points and explicitly sums the contributions 
-        of all pairs of points within the polygon. This directly computes the double integral by summation.
-        
-        **Note:** This method is O(N^2) (where N is number of sample points inside the polygon) and can be very slow 
-        for fine grids or large areas. It is primarily useful for validation or small areas.
-        
-        Parameters:
-        - `resolution` (float, optional): Spacing between sample points (grid cell size). If not provided, 
-                                          it will be determined such that the longest dimension of the polygon's 
-                                          bounding box has `grid_points` cells.
-        - `grid_points` (int, optional): Number of cells along the longest dimension (used to derive `resolution` if not given).
-        
-        Returns:
-        - `sigma_A` (float): The regional uncertainty (standard deviation) from brute-force integration.
+        Validate by gridding the polygon and summing the covariance over all pairs.
         """
-        # Determine grid spacing (resolution)
         minx, miny, maxx, maxy = self.polygon.bounds
-        width = maxx - minx
-        height = maxy - miny
+        width, height = (maxx - minx), (maxy - miny)
         if resolution is None:
-            # Use grid_points to set resolution for the longest side of the bounding box
             if grid_points <= 0:
-                raise ValueError("grid_points must be a positive integer.")
-            longest_side = max(width, height)
-            resolution = longest_side / grid_points
+                raise ValueError("grid_points must be positive.")
+            resolution = max(width, height) / grid_points
         if resolution <= 0:
             raise ValueError("resolution must be positive.")
-        
-        # Generate sample point coordinates (centers of grid cells) within the bounding box
+
         nx = int(math.ceil(width / resolution))
         ny = int(math.ceil(height / resolution))
-        x_coords = [minx + (i + 0.5) * resolution for i in range(nx)]
-        y_coords = [miny + (j + 0.5) * resolution for j in range(ny)]
-        
-        # Collect all points inside the polygon
-        points = []
-        for y in y_coords:
-            for x in x_coords:
-                if self.polygon.contains(Point(x, y)):
-                    points.append((x, y))
-        N = len(points)
+        xs = [minx + (i + 0.5) * resolution for i in range(nx)]
+        ys = [miny + (j + 0.5) * resolution for j in range(ny)]
+
+        pts = [(x, y) for y in ys for x in xs if self.polygon.contains(Point(x, y))]
+        N = len(pts)
         if N == 0:
-            raise ValueError("No sample points found inside the polygon at the given resolution.")
-        
-        # Sum semivariogram values for all unique pairs of points (i<j)
-        total_corr = 0.0
+            raise ValueError("No sample points inside polygon at given resolution.")
+
+        total_cov = 0.0
         for i in range(N):
-            x1, y1 = points[i]
+            x1, y1 = pts[i]
             for j in range(i + 1, N):
-                x2, y2 = points[j]
-                # Distance between point i and j
-                dist = math.hypot(x2 - x1, y2 - y1)
-                total_corr += (self.sigma2 - gamma_func(dist))
-        # total_corr now is sum_{i<j} γ(|xi - xj|)
-        # Each pair (i,j) corresponds to two ordered pairs in the double integral (i->j and j->i),
-        # so multiply by 2 to account for both orientations.
-        total_corr *= 2.0
+                x2, y2 = pts[j]
+                d = math.hypot(x2 - x1, y2 - y1)
+                total_cov += (self.sigma2 - gamma_func(d))
+        total_cov *= 2.0
+        
+        total_cov += N * self.sigma2
 
-        # Convert the summed semivariance to a continuous double integral value:
-        # Each point represents an area element of size (resolution^2). For each pair, the contribution to ∬_A γ(h) is γ(dist) * (area_element_i) * (area_element_j).
-        area_element = resolution ** 2
-        integral_corr = total_corr * (area_element * area_element)
+        area_el = resolution ** 2
+        integral_cov = total_cov * (area_el ** 2)
+        sigma2_A = integral_cov / (self.area ** 2)
+        return math.sqrt(max(sigma2_A, 0.0))
 
-        # Now compute σ_A^2 = σ_Δz^2 – (1/A^2) * ∬_A γ(h) 
-        sigma2_A = (integral_corr / (self.area ** 2))
-        if sigma2_A < 0:
-            sigma2_A = 0.0  # guard against slight negative due to numerical error
-        return math.sqrt(sigma2_A)
-    
-    def estimate_monte_carlo(self, gamma_func, n_pairs=10_000, *, seed=None):
+    def estimate_monte_carlo(
+        self,
+        gamma_func: Callable[[np.ndarray], np.ndarray],
+        n_pairs: int = 200_000,
+        seed: Optional[int] = None,
+        sigma_func: Optional[Callable[[np.ndarray], np.ndarray]] = None,
+        sigma2_total: Optional[float] = None
+    ) -> float:
         """
-        Monte-Carlo estimator of σ_A (area-averaged standard deviation).
+        Plain Monte Carlo on independent pairs.
 
-        Parameters
-        ----------
-        gamma_func : callable
-            Semivariogram γ(h).
-        n_pairs : int, default 10000
-            Number of independent point pairs.
-        seed : int or None
-            RNG seed for reproducibility.
-
-        Returns
-        -------
-        float
-            σ_A.
+        Homoscedastic:
+            Var(mean) ≈ E[ C(‖X−Y‖) ],  with C(h)=σ²_total−γ(h)
+        Heteroscedastic (provide sigma_func returning STD at (x,y)):
+            Var(mean) ≈ E[ ρ(‖X−Y‖) · σ(X) · σ(Y) ],  ρ(h)=1−γ(h)/σ²_total
         """
         if n_pairs <= 0:
             raise ValueError("n_pairs must be positive.")
-        if seed is not None:
-            random.seed(seed)
 
-        minx, miny, maxx, maxy = self.polygon.bounds
-        get_point = lambda: next(
-            p for p in iter(lambda: Point(random.uniform(minx, maxx),
-                                        random.uniform(miny, maxy)), None)
-            if self.polygon.contains(p)
-        )
+        mp = self._as_multipolygon(self.polygon)
+        sampler = self._UniformMultiPolygonSampler(mp, rng=seed)
+        X = sampler.sample(n_pairs)
+        Y = sampler.sample(n_pairs)
+        d = np.linalg.norm(X - Y, axis=1)
 
-        total = 0.0
-        for _ in range(n_pairs):
-            p1, p2 = get_point(), get_point()
-            h = p1.distance(p2)          # or math.hypot(...)
-            total += self.sigma2 - gamma_func(h)
+        s2 = self.sigma2 if sigma2_total is None else float(sigma2_total)
 
-        sigma2_A = total / n_pairs
-        return 0.0 if sigma2_A < 0 else math.sqrt(sigma2_A)
-    
-    def estimate_fft(self, gamma_func, cell_size=None, grid_points=200):
+        if sigma_func is None:
+            
+            cov = self._cov_from_gamma(gamma_func, s2)
+            var_mean = float(np.mean(cov(d)))
+            return 0.0 if var_mean < 0 else float(np.sqrt(var_mean))
+
+        sigX = np.asarray(sigma_func(X), dtype=float).reshape(-1)
+        sigY = np.asarray(sigma_func(Y), dtype=float).reshape(-1)
+        rho = 1.0 - (gamma_func(d) / s2)
+        rho = np.clip(rho, -1.0, 1.0)
+        var_mean = float(np.mean(rho * sigX * sigY))
+        return 0.0 if var_mean < 0 else float(np.sqrt(var_mean))
+
+    def estimate_fft(self, gamma_func: Callable[[np.ndarray], np.ndarray], cell_size: Optional[float] = None, grid_points: int = 200) -> float:
         """
-        FFT convolution method for σ_A.
-        
-        Rasterizes the polygon onto a grid and computes the auto-correlation of the polygon shape 
-        using FFTs. Then sums the covariance function over all pair separations weighted by the overlap area.
-        
-        This method converts the double integral into convolutions: 
-        it computes the spatial overlap (auto-correlation) of the area for each separation distance 
-        and multiplies by the covariance (σ_Δz^2 - γ) at that distance. Using FFT significantly speeds up 
-        the calculation of the overlap for all possible shifts.
-        
-        **Note:** The polygon is discretized on a grid, so the accuracy depends on the grid resolution. 
-        Ensure `cell_size` is sufficiently small relative to the spatial correlation range for accurate results. 
-        
-        Parameters:
-        - `cell_size` (float, optional): The size of each grid cell in the same units as the polygon coordinates. 
-                                         A smaller cell_size gives higher resolution (and more computation).
-        - `grid_points` (int, optional): If `cell_size` is not specified, the number of grid cells along the longest 
-                                         side of the polygon’s bounding box. This will determine `cell_size` as 
-                                         (longest_side_length / grid_points).
-        
-        Returns:
-        - `sigma_A` (float): The regional uncertainty (standard deviation) computed via FFT convolution.
+        FFT-based estimator via convolution of polygon mask autocorrelation with covariance map.
         """
-        # Determine grid resolution for rasterization
         minx, miny, maxx, maxy = self.polygon.bounds
-        width = maxx - minx
-        height = maxy - miny
+        width, height = (maxx - minx), (maxy - miny)
         if cell_size is None:
             if grid_points <= 0:
-                raise ValueError("grid_points must be a positive integer.")
-            longest_side = max(width, height)
-            cell_size = longest_side / grid_points
+                raise ValueError("grid_points must be positive.")
+            cell_size = max(width, height) / grid_points
         if cell_size <= 0:
             raise ValueError("cell_size must be positive.")
-        
-        # Determine grid dimensions within bounding box
+
         nx = int(math.ceil(width / cell_size))
         ny = int(math.ceil(height / cell_size))
-        # Pad the grid to avoid convolution wrap-around (pad to next power of 2 on each side)
-        def next_power_of_two(n):
-            """
-            Return the next power of two greater than or equal to ``n``.
 
-            Parameters
-            ----------
-            n : int
-                Input integer for which to compute the power of two.
+        def next_pow2(n): return 1 << ((n - 1).bit_length())
+        pad_x = next_pow2(2 * nx)
+        pad_y = next_pow2(2 * ny)
 
-            Returns
-            -------
-            int
-                The smallest power of two that is greater than or equal to ``n``.
-            """
-            return 1 << ((n - 1).bit_length())
-        pad_x = next_power_of_two(2 * nx)
-        pad_y = next_power_of_two(2 * ny)
-        
-        # Rasterize polygon onto grid (binary mask: 1 inside polygon, 0 outside)
         mask = np.zeros((pad_y, pad_x), dtype=float)
-        # We'll place the polygon roughly centered in the padded grid to symmetrize the convolution space
-        offset_x = (pad_x - nx) // 2
-        offset_y = (pad_y - ny) // 2
-        # Sample points at cell centers; mark mask cell as 1 if center is inside polygon
+        off_x = (pad_x - nx) // 2
+        off_y = (pad_y - ny) // 2
         y0 = miny + 0.5 * cell_size
         for j in range(ny):
             x0 = minx + 0.5 * cell_size
@@ -1688,130 +1303,62 @@ class RegionalUncertaintyEstimator:
             for i in range(nx):
                 x = x0 + i * cell_size
                 if self.polygon.contains(Point(x, y)):
-                    mask[offset_y + j, offset_x + i] = 1.0
-        
-        # Compute autocorrelation of mask using FFT (via convolution theorem)
-        fft_mask = np.fft.rfft2(mask)  # real FFT for efficiency
-        power_spectrum = fft_mask * np.conj(fft_mask)  # |FFT(mask)|^2
-        corr = np.fft.irfft2(power_spectrum, s=mask.shape)  # inverse FFT to get convolution results
-        corr = np.fft.fftshift(corr)  # shift zero-lag to center of array
-        
-        # Now 'corr' array holds the overlap area (in number of cells) of the polygon with itself 
-        # at each displacement (i-offset in x, j-offset in y). We need to multiply this by covariance at that displacement.
-        center_y, center_x = corr.shape[0] // 2, corr.shape[1] // 2
-        # Loop over all displacements and accumulate covariance contribution
-        total_covariance = 0.0
-        for j in range(corr.shape[0]):
-            dy = (j - center_y) * cell_size
-            for i in range(corr.shape[1]):
-                dx = (i - center_x) * cell_size
-                # Distance for this displacement
-                dist = math.hypot(dx, dy)
-                # Covariance = σ_Δz^2 - γ(dist)
-                cov = self.sigma2 - gamma_func(dist)
-                # Overlap area for this displacement = corr[j, i] * (area of one cell)
-                overlap_area = corr[j, i] * (cell_size ** 2)
-                # Contribution to double integral: covariance * overlap_area
-                total_covariance += cov * overlap_area
-        # 'total_covariance' now approximates ∬_A [σ^2 - γ(h)] dx dy = σ_Δz^2 * A^2 - ∬_A γ(h) dx dy.
-        # We want σ_A^2 = (1/A^2) * ∬_A [σ^2 - γ(h)] dx dy.
-        sigma2_A = total_covariance / (self.area ** 2)
-        if sigma2_A < 0:
-            sigma2_A = 0.0
-        return math.sqrt(sigma2_A)
-    
-    # ---------------------------------------------------------------------
-    # Hugonnet et al. (2022) regional uncertainty – Monte-Carlo covariance
-    # integration using K random “centre” samples inside the polygon.
-    # Default K = 100 (the value recommended in the paper).
-    # ---------------------------------------------------------------------
-    def estimate_hugonnet(self,gamma_func, k: int = 100) -> float:
-        """
-        Hugonnet et al. (2022) regional uncertainty of the *mean* error
-        inside the polygon.
+                    mask[off_y + j, off_x + i] = 1.0
 
-        Parameters
-        ----------
-        k : int, default 100
-            Number of random “centre” points (Hugonnet’s *K*).  Higher
-            gives more accurate integration but scales linearly in
-            runtime.
+        F = np.fft.rfft2(mask)
+        corr = np.fft.irfft2(F * np.conj(F), s=mask.shape)
+        corr = np.fft.fftshift(corr)
 
-        Returns
-        -------
-        sigma_A : float
-            One-sigma uncertainty (standard deviation) of the mean error
-            over the polygon.
+        cy, cx = np.array(corr.shape) // 2
+        ys, xs = np.indices(corr.shape)
+        dist = np.hypot((xs - cx) * cell_size, (ys - cy) * cell_size)
+        cov_map = self.sigma2 - gamma_func(dist)
+
+        cell_area = cell_size ** 2
+        total_cov = float(np.sum(corr * cov_map) * (cell_area ** 2))
+        sigma2_A = total_cov / (self.area ** 2)
+        return math.sqrt(max(sigma2_A, 0.0))
+
+    def estimate_hugonnet(self, gamma_func: Callable[[np.ndarray], np.ndarray], k: int = 100, *, seed: Optional[int] = None) -> float:
         """
-        # ---- 1.  Build a list of all DEM-pixel centres that fall inside A
-        #         (these represent the N points used in the double integral)
+        K-center shortcut (Hugonnet et al., 2022) using DEM pixel centers inside A.
+        Uses per-pixel variance map if available on raster_data_handler.sigma2_map; otherwise constant.
+        """
+        rng = np.random.default_rng(seed)
         rio_da = self.raster_data_handler.rioxarray_obj
         if rio_da is None:
-            raise RuntimeError("Raster must be loaded before calling Hugonnet uncertainty")
+            raise RuntimeError("Load raster before Hugonnet estimator.")
 
-        # pixel-centre coordinates
         xs = rio_da.x.values
         ys = rio_da.y.values
-        Ncols, Nrows = len(xs), len(ys)
 
-        # Generate a 2-D grid of all pixel centres, mask by polygon A
-        pts   = []
-        for j, y in enumerate(ys):
-            for i, x in enumerate(xs):
+        pts = []
+        for y in ys:
+            for x in xs:
                 if self.polygon.contains(Point(float(x), float(y))):
-                    pts.append((x, y))
+                    pts.append((float(x), float(y)))
         if not pts:
-            raise RuntimeError("No DEM pixels found inside the polygon")
-        pts = np.asarray(pts)                         # shape (N, 2)
-        N   = pts.shape[0]
+            raise RuntimeError("No DEM pixels inside polygon.")
+        pts = np.asarray(pts, dtype=float)
+        N = pts.shape[0]
 
-        # ---- 2.  Retrieve per-pixel vertical PRECISION σ²_dh for heteroscedasticity
-        # If the user provided a per-pixel variance map, use it, else assume
-        # a constant sill (conservative).
         if hasattr(self.raster_data_handler, "sigma2_map"):
-            sigma2_map = self.raster_data_handler.sigma2_map  # same shape as raster
-            # sample those pixel variances
-            sig2_pixels = []
-            for x, y in pts:
-                col = np.argmin(np.abs(xs - x))
-                row = np.argmin(np.abs(ys - y))
-                sig2_pixels.append(float(sigma2_map[row, col]))
-            sig2_pixels = np.asarray(sig2_pixels)
+            sig2_map = np.asarray(self.raster_data_handler.sigma2_map, dtype=float)
+
+            def nn_sigma2(xy):
+                x, y = xy
+                ix = int(np.argmin(np.abs(xs - x)))
+                iy = int(np.argmin(np.abs(ys - y)))
+                return sig2_map[iy, ix]
+            sig2_pixels = np.apply_along_axis(nn_sigma2, 1, pts)
         else:
-            # constant = total sill of variogram
-            total_sill  = (self.nugget or 0.0) + np.sum(self.sills)
-            sig2_pixels = np.full(N, total_sill, dtype=float)
+            sig2_pixels = np.full(N, self.sigma2, dtype=float)
 
-        # average pixel variance σ²_dh|A (Eq. 19 in Hugonnet et al.)
-        sigma2_dh_A = sig2_pixels.mean()
+        sigma2_dh_A = float(np.mean(sig2_pixels))  # Eq. 19
 
-        # ---- 3.  Convenience: correlation ρ(d) = 1 – γ(d)/sill  (normalised)
-        total_sill = (self.nugget or 0.0) + np.sum(self.sills)
+        def rho(dist):
+            return 1.0 - (gamma_func(dist) / self.sigma2)
 
-        def rho(dist: np.ndarray) -> np.ndarray:
-            """
-            Compute the normalised correlation function ρ(d).
-
-            Given an array of separation distances ``dist``, this function
-            evaluates the variogram model at those distances, divides by the
-            total sill (nugget plus sills), and returns ``1 – γ(d)/sill``.
-
-            Parameters
-            ----------
-            dist : numpy.ndarray
-                Array of separation distances at which to evaluate ρ.
-
-            Returns
-            -------
-            numpy.ndarray
-                The correlation values corresponding to each distance in ``dist``.
-            """
-            # γ(dist) from the fitted variogram model
-            gamma_vals = gamma_func(dist)
-            return 1.0 - (gamma_vals / total_sill)
-
-        # ---- 4.  Draw K random “centre” points uniformly inside A
-        rng = np.random.default_rng()
         centres = []
         minx, miny, maxx, maxy = self.polygon.bounds
         while len(centres) < k:
@@ -1819,241 +1366,220 @@ class RegionalUncertaintyEstimator:
             cy = rng.uniform(miny, maxy)
             if self.polygon.contains(Point(cx, cy)):
                 centres.append((cx, cy))
-        centres = np.asarray(centres)                 # (K, 2)
+        centres = np.asarray(centres, dtype=float)
 
-        # ---- 5.  Compute Hugonnet integral I = (1/K) Σ_k Σ_i ρ(d_ki)
         I_sum = 0.0
         for cx, cy in centres:
-            # Euclidean distances to every pixel point
-            dx = pts[:, 0] - cx
-            dy = pts[:, 1] - cy
-            d  = np.hypot(dx, dy)
-            I_sum += rho(d).sum()
-        I = I_sum / k                                # average over K
+            d = np.hypot(pts[:, 0] - cx, pts[:, 1] - cy)
+            I_sum += float(np.sum(rho(d)))
+        I = I_sum / k
 
-        # ---- 6.  regional variance σ²_A  (Eq. 18)
-        sigma2_A = sigma2_dh_A * (I / N)
+        sigma2_A = sigma2_dh_A * (I / N)  # Eq. 18
+        return 0.0 if sigma2_A < 0 else float(np.sqrt(sigma2_A))
 
-        # guard small numerical negatives
-        if sigma2_A < 0:
-            sigma2_A = 0.0
-
-        return float(np.sqrt(sigma2_A))
-    # --- FIX 1: robust level_of_detail selection ------------------------------
-    def estimate_monte_carlo_raster(self, gamma_func, level_of_detail="detailed", n_pairs=10000):
-        """Monte-Carlo estimator of σ_A (area-averaged standard deviation) on a raster."""
+    def estimate_monte_carlo_raster(
+        self,
+        gamma_func: Callable[[np.ndarray], np.ndarray],
+        level_of_detail: str = "detailed",
+        n_pairs: int = 100_000,
+        seed: Optional[int] = None,
+        sigma_func: Optional[Callable[[np.ndarray], np.ndarray]] = None,
+        sigma2_total: Optional[float] = None,
+    ) -> float:
+        """
+        Monte Carlo estimator over raster-valid footprint ('detailed') or bbox ('bbox').
+        """
         if level_of_detail == "detailed":
-            polygon = self.raster_data_handler.merged_geom
+            if getattr(self.raster_data_handler, "merged_geom", None) is None:
+                self.raster_data_handler.get_detailed_area()
+            poly = self.raster_data_handler.merged_geom
         elif level_of_detail in ("coarse", "box", "bbox"):
-            polygon = self.raster_data_handler.bbox
+            poly = self.raster_data_handler.bbox
         else:
-            raise ValueError("level_of_detail must be 'detailed', 'coarse', 'box', or 'bbox'")
+            raise ValueError("level_of_detail must be 'detailed' or 'bbox'/'box'/'coarse'.")
 
-        if n_pairs <= 0:
-            raise ValueError("n_pairs must be positive.")
+        mp = self._as_multipolygon(poly)
+        sampler = self._UniformMultiPolygonSampler(mp, rng=seed)
+        X = sampler.sample(n_pairs)
+        Y = sampler.sample(n_pairs)
+        d = np.linalg.norm(X - Y, axis=1)
 
-        minx, miny, maxx, maxy = polygon.bounds
-        get_point = lambda: next(
-            p for p in iter(lambda: Point(random.uniform(minx, maxx),
-                                           random.uniform(miny, maxy)), None)
-            if polygon.contains(p)
-        )
+        s2_ref = float(self.sigma2 if sigma2_total is None else sigma2_total)
+        eps = np.finfo(float).eps
+        s2_ref = max(s2_ref, eps)
 
-        total = 0.0
-        for _ in range(n_pairs):
-            p1, p2 = get_point(), get_point()
-            h = p1.distance(p2)
-            total += self.sigma2 - gamma_func(h)
+        if sigma_func is None:
+            C = s2_ref - gamma_func(d)
+            var_mean = float(np.mean(C))
+            return 0.0 if var_mean < 0 else float(np.sqrt(var_mean))
 
-        sigma2_A = total / n_pairs
-        return 0.0 if sigma2_A < 0 else math.sqrt(sigma2_A)
-    
-    def calc_mean_random_uncorrelated(self):
+        sigX = np.asarray(sigma_func(X), dtype=float).reshape(-1)
+        sigY = np.asarray(sigma_func(Y), dtype=float).reshape(-1)
+        rho = 1.0 - (gamma_func(d) / s2_ref)
+        rho = np.clip(rho, -1.0, 1.0)
+        var_mean = float(np.mean(rho * sigX * sigY))
+        return 0.0 if var_mean < 0 else float(np.sqrt(var_mean))
+
+    def calc_mean_random_correlated_raster(self, level_of_detail, n_pairs, seed: Optional[int] = None, sigma_func=None) -> None:
+        """Estimate mean correlated uncertainty via raster integration (central and 16/84%)."""
+        if self.gamma_func_total:
+            self.total_mean_correlated_uncertainty_raster = self.estimate(self.gamma_func_total, method="raster", level_of_detail=level_of_detail, n_pairs=n_pairs, seed=seed, sigma_func=sigma_func, sigma2_total=self.sigma2)
+        if self.gamma_func_total_min:
+            self.total_mean_correlated_uncertainty_min_raster = self.estimate(self.gamma_func_total_min, method="raster", level_of_detail=level_of_detail, n_pairs=n_pairs, seed=seed, sigma_func=sigma_func, sigma2_total=self.sigma2_min)
+        if self.gamma_func_total_max:
+            self.total_mean_correlated_uncertainty_max_raster = self.estimate(self.gamma_func_total_max, method="raster", level_of_detail=level_of_detail, n_pairs=n_pairs, seed=seed, sigma_func=sigma_func, sigma2_total=self.sigma2_max)
+        if self.gamma_func_1:
+            self.mean_random_correlated_1_raster = self.estimate(self.gamma_func_1, method="raster", level_of_detail=level_of_detail, n_pairs=n_pairs, seed=seed, sigma_func=sigma_func, sigma2_total=self.sigma2)
+        if self.gamma_func_1_min:
+            self.mean_random_correlated_1_min_raster = self.estimate(self.gamma_func_1_min, method="raster", level_of_detail=level_of_detail, n_pairs=n_pairs, seed=seed, sigma_func=sigma_func, sigma2_total=self.sigma2_min)
+        if self.gamma_func_1_max:
+            self.mean_random_correlated_1_max_raster = self.estimate(self.gamma_func_1_max, method="raster", level_of_detail=level_of_detail, n_pairs=n_pairs, seed=seed, sigma_func=sigma_func, sigma2_total=self.sigma2_max)
+        if self.gamma_func_2:
+            self.mean_random_correlated_2_raster = self.estimate(self.gamma_func_2, method="raster", level_of_detail=level_of_detail, n_pairs=n_pairs, seed=seed, sigma_func=sigma_func, sigma2_total=self.sigma2)
+        if self.gamma_func_2_min:
+            self.mean_random_correlated_2_min_raster = self.estimate(self.gamma_func_2_min, method="raster", level_of_detail=level_of_detail, n_pairs=n_pairs, seed=seed, sigma_func=sigma_func, sigma2_total=self.sigma2_min)
+        if self.gamma_func_2_max:
+            self.mean_random_correlated_2_max_raster = self.estimate(self.gamma_func_2_max, method="raster", level_of_detail=level_of_detail, n_pairs=n_pairs, seed=seed, sigma_func=sigma_func, sigma2_total=self.sigma2_max)
+        if self.gamma_func_3:
+            self.mean_random_correlated_3_raster = self.estimate(self.gamma_func_3, method="raster", level_of_detail=level_of_detail, n_pairs=n_pairs, seed=seed, sigma_func=sigma_func, sigma2_total=self.sigma2)
+        if self.gamma_func_3_min:
+            self.mean_random_correlated_3_min_raster = self.estimate(self.gamma_func_3_min, method="raster", level_of_detail=level_of_detail, n_pairs=n_pairs, seed=seed, sigma_func=sigma_func, sigma2_total=self.sigma2_min)
+        if self.gamma_func_3_max:
+            self.mean_random_correlated_3_max_raster = self.estimate(self.gamma_func_3_max, method="raster", level_of_detail=level_of_detail, n_pairs=n_pairs, seed=seed, sigma_func=sigma_func, sigma2_total=self.sigma2_max)
+
+    def _bootstrap_correlated_polygon(self, n_pairs: int = 200_000, seed: Optional[int] = None) -> None:
         """
-        Calculate the mean random uncorrelated uncertainty.
-        
-        Compute the mean random uncorrelated uncertainty by dividing the RMS by the square root of the length of the data array.
-        The result is stored in the `mean_random_uncorrelated` attribute of the instance.
+        Propagate bootstrap variogram samples through Monte Carlo using one fixed set of random pairs.
         """
-        
+        samples = self.variogram_analysis.param_samples
+        if samples is None or samples.size == 0:
+            return
+
+        n_comp = self.variogram_analysis.best_model_config['components']
+        has_nug = self.variogram_analysis.best_model_config['nugget']
+        bmf = self.variogram_analysis.best_model_func
+
+        mp = self._as_multipolygon(self.polygon)
+        sampler = self._UniformMultiPolygonSampler(mp, rng=seed)
+        X = sampler.sample(n_pairs)
+        Y = sampler.sample(n_pairs)
+        d = np.linalg.norm(X - Y, axis=1)
+
+        def _sigma_from_params(pars):
+            
+            if has_nug:
+                nug = float(pars[-1])
+                sills = np.asarray(pars[:n_comp], dtype=float)
+            else:
+                nug = 0.0
+                sills = np.asarray(pars[:n_comp], dtype=float)
+            s2_total = float(nug + np.sum(sills))
+            gamma_d = bmf(d, *pars)
+            var_mean = float(np.mean(s2_total - gamma_d))
+            return (0.0 if var_mean < 0 else float(np.sqrt(var_mean))), s2_total
+
+        best_sig, _ = _sigma_from_params(self.variogram_analysis.best_params)
+        self.total_mean_correlated_uncertainty_polygon = best_sig
+
+        unc_tot, unc_c1, unc_c2, unc_c3 = [], [], [], []
+        for pars in samples:
+            sig, s2_total = _sigma_from_params(pars)
+            unc_tot.append(sig)
+
+            if has_nug:
+                nug = float(pars[-1])
+                sills = np.asarray(pars[:n_comp], dtype=float)
+                ranges = np.asarray(pars[n_comp:n_comp * 2], dtype=float)
+            else:
+                nug = 0.0
+                sills = np.asarray(pars[:n_comp], dtype=float)
+                ranges = np.asarray(pars[n_comp:n_comp * 2], dtype=float)
+
+            for i in range(n_comp):
+                
+                p_i = [0.0] * (2 * n_comp + (1 if has_nug else 0))
+                p_i[i] = float(sills[i])                  # sill block
+                p_i[n_comp + i] = float(ranges[i])        # range block
+                if has_nug:
+                    p_i[-1] = nug
+
+                gamma_i = bmf(d, *p_i)
+                var_i = float(np.mean(s2_total - gamma_i))
+                sig_i = 0.0 if var_i < 0 else float(np.sqrt(var_i))
+                if i == 0:
+                    unc_c1.append(sig_i)
+                elif i == 1:
+                    unc_c2.append(sig_i)
+                elif i == 2:
+                    unc_c3.append(sig_i)
+
+        def pct(a, q): return float(np.percentile(a, q)) if a else None
+        self.total_mean_correlated_uncertainty_min_polygon = pct(unc_tot, 16)
+        self.total_mean_correlated_uncertainty_polygon = pct(unc_tot, 50)
+        self.total_mean_correlated_uncertainty_max_polygon = pct(unc_tot, 84)
+
+        if unc_c1:
+            self.mean_random_correlated_1_min_polygon = pct(unc_c1, 16)
+            self.mean_random_correlated_1_polygon = pct(unc_c1, 50)
+            self.mean_random_correlated_1_max_polygon = pct(unc_c1, 84)
+        if unc_c2:
+            self.mean_random_correlated_2_min_polygon = pct(unc_c2, 16)
+            self.mean_random_correlated_2_polygon = pct(unc_c2, 50)
+            self.mean_random_correlated_2_max_polygon = pct(unc_c2, 84)
+        if unc_c3:
+            self.mean_random_correlated_3_min_polygon = pct(unc_c3, 16)
+            self.mean_random_correlated_3_polygon = pct(unc_c3, 50)
+            self.mean_random_correlated_3_max_polygon = pct(unc_c3, 84)
+
+    def calc_mean_random_correlated_polygon(self, n_pairs: int = 200_000, seed: Optional[int] = None, sigma_func=None) -> None:
+        """
+        Correlated term over polygon via Monte Carlo with bootstrap propagation (16/50/84 percentiles).
+        """
+        if self.gamma_func_total:
+            self.total_mean_correlated_uncertainty_polygon = self.estimate(
+                self.gamma_func_total, method="monte_carlo", n_pairs=n_pairs, seed=seed, sigma_func=sigma_func, sigma2_total=self.sigma2
+            )
+        self._bootstrap_correlated_polygon(n_pairs=n_pairs, seed=seed)
+
+    def calc_mean_random_uncorrelated(self) -> None:
+        """
+        Mean uncorrelated term using RMS / sqrt(N) over all valid raster values.
+        """
         data = self.raster_data_handler.data_array
-
-        def calculate_rms(values):
-            """Calculate the Root Mean Square (RMS) of an array of numbers."""
-            # Step 1: Square all the numbers
-            squared_values = [x**2 for x in values]
-            
-            # Step 2: Calculate the mean of the squares
-            mean_of_squares = sum(squared_values) / len(values)
-            
-            # Step 3: Take the square root of the mean
-            rms = math.sqrt(mean_of_squares)
-    
-            return rms
-        
-        rms = calculate_rms(data)
-
+        if data is None or len(data) == 0:
+            raise RuntimeError("Load raster data first.")
+        rms = float(np.sqrt(np.mean(np.square(data))))
         self.mean_random_uncorrelated = rms / np.sqrt(len(data))
-    
-    def calc_mean_random_correlated_polygon(self, n_pairs, seed):
-        """Estimate mean correlated uncertainty within the polygon.
 
-        This method computes the random correlated component of the mean
-        uncertainty by Monte Carlo integration for each available
-        semivariogram component (total, min, max, and up to three
-        nested components).  The results are stored on the instance
-        with attribute names reflecting the component and polygon.
-
-        Parameters
-        ----------
-        n_pairs : int
-            Number of random point pairs to sample for the Monte Carlo
-            estimator.
-        seed : int
-            Random seed used to initialize the pseudo-random number
-            generator for reproducible sampling.
+    def calc_mean_uncertainty(self, n_pairs: int = 200_000, level_of_detail: str = "bbox", seed: Optional[int] = None, sigma_func=None) -> None:
         """
-        if self.gamma_func_total:
-            self.total_mean_correlated_uncertainty_polygon = self.estimate(self.gamma_func_total, method="monte_carlo", n_pairs=n_pairs, seed=seed)
-        if self.gamma_func_total_min:
-            self.total_mean_correlated_uncertainty_min_polygon = self.estimate(self.gamma_func_total_min, method="monte_carlo", n_pairs=n_pairs, seed=seed)
-        if self.gamma_func_total_max:
-            self.total_mean_correlated_uncertainty_max_polygon = self.estimate(self.gamma_func_total_max, method="monte_carlo", n_pairs=n_pairs, seed=seed)
-        if self.gamma_func_1:
-            self.mean_random_correlated_1_polygon = self.estimate(self.gamma_func_1, method="monte_carlo", n_pairs=n_pairs, seed=seed)
-        if self.gamma_func_1_min:
-            self.mean_random_correlated_1_min_polygon = self.estimate(self.gamma_func_1_min, method="monte_carlo", n_pairs=n_pairs, seed=seed)
-        if self.gamma_func_1_max:
-            self.mean_random_correlated_1_max_polygon = self.estimate(self.gamma_func_1_max, method="monte_carlo", n_pairs=n_pairs, seed=seed)
-        if self.gamma_func_2:
-            self.mean_random_correlated_2_polygon = self.estimate(self.gamma_func_2, method="monte_carlo", n_pairs=n_pairs, seed=seed)
-        if self.gamma_func_2_min:
-            self.mean_random_correlated_2_min_polygon = self.estimate(self.gamma_func_2_min, method="monte_carlo", n_pairs=n_pairs, seed=seed)
-        if self.gamma_func_2_max:
-            self.mean_random_correlated_2_max_polygon = self.estimate(self.gamma_func_2_max, method="monte_carlo", n_pairs=n_pairs, seed=seed)
-        if self.gamma_func_3:
-            self.mean_random_correlated_3_polygon = self.estimate(self.gamma_func_3, method="monte_carlo", n_pairs=n_pairs, seed=seed)
-        if self.gamma_func_3_min:
-            self.mean_random_correlated_3_min_polygon = self.estimate(self.gamma_func_3_min, method="monte_carlo", n_pairs=n_pairs, seed=seed)
-        if self.gamma_func_3_max:
-            self.mean_random_correlated_3_max_polygon = self.estimate(self.gamma_func_3_max, method="monte_carlo", n_pairs=n_pairs, seed=seed)
-
-    # -------------------------------------------------------------------------
-    # FIX 2: propagate n_pairs correctly & use central values in print_results
-    # -------------------------------------------------------------------------
-    def calc_mean_random_correlated_raster(self, level_of_detail, n_pairs):
-        """Estimate mean correlated uncertainty via raster integration.
-
-        Computes the mean random correlated component of the uncertainty
-        over the raster's bounding box or a more detailed representation
-        of the polygon, depending on ``level_of_detail``.  Results are
-        stored as attributes on the estimator instance.
-
-        Parameters
-        ----------
-        level_of_detail : str
-            One of ``'detailed'``, ``'coarse'``, ``'box'`` or ``'bbox'``
-            indicating how to approximate the polygon.  A detailed level
-            uses the exact polygon shape; coarse/box/bbox successively
-            simplify the geometry.
-        n_pairs : int
-            Number of random point pairs to use if Monte Carlo is
-            employed internally (ignored for raster-based methods).
-        """
-        if self.gamma_func_total:
-            self.total_mean_correlated_uncertainty_raster = self.estimate(self.gamma_func_total, method="raster", level_of_detail=level_of_detail, n_pairs=n_pairs)
-        if self.gamma_func_total_min:
-            self.total_mean_correlated_uncertainty_min_raster = self.estimate(self.gamma_func_total_min, method="raster", level_of_detail=level_of_detail, n_pairs=n_pairs)
-        if self.gamma_func_total_max:
-            self.total_mean_correlated_uncertainty_max_raster = self.estimate(self.gamma_func_total_max, method="raster", level_of_detail=level_of_detail, n_pairs=n_pairs)
-        if self.gamma_func_1:
-            self.mean_random_correlated_1_raster = self.estimate(self.gamma_func_1, method="raster", level_of_detail=level_of_detail, n_pairs=n_pairs)
-        if self.gamma_func_1_min:
-            self.mean_random_correlated_1_min_raster = self.estimate(self.gamma_func_1_min, method="raster", level_of_detail=level_of_detail, n_pairs=n_pairs)
-        if self.gamma_func_1_max:
-            self.mean_random_correlated_1_max_raster = self.estimate(self.gamma_func_1_max, method="raster", level_of_detail=level_of_detail, n_pairs=n_pairs)
-        if self.gamma_func_2:
-            self.mean_random_correlated_2_raster = self.estimate(self.gamma_func_2, method="raster", level_of_detail=level_of_detail, n_pairs=n_pairs)
-        if self.gamma_func_2_min:
-            self.mean_random_correlated_2_min_raster = self.estimate(self.gamma_func_2_min, method="raster", level_of_detail=level_of_detail, n_pairs=n_pairs)
-        if self.gamma_func_2_max:
-            self.mean_random_correlated_2_max_raster = self.estimate(self.gamma_func_2_max, method="raster", level_of_detail=level_of_detail, n_pairs=n_pairs)
-        if self.gamma_func_3:
-            self.mean_random_correlated_3_raster = self.estimate(self.gamma_func_3, method="raster", level_of_detail=level_of_detail, n_pairs=n_pairs)
-        if self.gamma_func_3_min:
-            self.mean_random_correlated_3_min_raster = self.estimate(self.gamma_func_3_min, method="raster", level_of_detail=level_of_detail, n_pairs=n_pairs)
-        if self.gamma_func_3_max:
-            self.mean_random_correlated_3_max_raster = self.estimate(self.gamma_func_3_max, method="raster", level_of_detail=level_of_detail, n_pairs=n_pairs)
-
-    def calc_mean_uncertainty(self, n_pairs=100000, level_of_detail="detailed", seed=None):
-        """Compute the total mean uncertainty for the area of interest.
-
-        This convenience method invokes the uncorrelated, correlated
-        polygon-based, and correlated raster-based estimators in turn,
-        passing along the number of sample pairs and level of detail
-        where appropriate.  After the component uncertainties are
-        computed, the total mean uncertainty (and its minimum/maximum
-        bounds if available) is assembled via quadrature and stored on
-        the instance.  No values are returned directly.
-
-        Parameters
-        ----------
-        n_pairs : int, optional
-            Number of random point pairs to use in correlated uncertainty
-            estimation (default is 100000).
-        level_of_detail : str, optional
-            Approximation level for raster-based uncertainty estimation
-            (default is ``'detailed'``).  See
-            :meth:`calc_mean_random_correlated_raster` for details.
-        seed : int or None, optional
-            Random seed for reproducible Monte Carlo sampling.  If
-            ``None``, a random state will be used.
+        Compute quadrature of uncorrelated + correlated (polygon), and also raster variants.
         """
         self.calc_mean_random_uncorrelated()
-        self.calc_mean_random_correlated_polygon(n_pairs=n_pairs, seed=seed)
-        # pass the same n_pairs to raster (was hard‑coded before)
-        self.calc_mean_random_correlated_raster(level_of_detail=level_of_detail, n_pairs=n_pairs)
-        if self.mean_random_uncorrelated and self.total_mean_correlated_uncertainty_polygon:
-            self.total_mean_uncertainty_polygon = math.sqrt(
-                self.mean_random_uncorrelated ** 2 +
-                self.total_mean_correlated_uncertainty_polygon ** 2)
-        if self.mean_random_uncorrelated and self.total_mean_correlated_uncertainty_min_polygon:
-            self.total_mean_uncertainty_min_polygon = math.sqrt(
-                self.mean_random_uncorrelated ** 2 +
-                self.total_mean_correlated_uncertainty_min_polygon ** 2)
-        if self.mean_random_uncorrelated and self.total_mean_correlated_uncertainty_max_polygon:
-            self.total_mean_uncertainty_max_polygon = math.sqrt(
-                self.mean_random_uncorrelated ** 2 +
-                self.total_mean_correlated_uncertainty_max_polygon ** 2)
-        if self.mean_random_uncorrelated and self.total_mean_correlated_uncertainty_raster:
-            self.total_mean_uncertainty_raster = math.sqrt(
-                self.mean_random_uncorrelated ** 2 +
-                self.total_mean_correlated_uncertainty_raster ** 2)
-        if self.mean_random_uncorrelated and self.total_mean_correlated_uncertainty_min_raster:
-            self.total_mean_uncertainty_min_raster = math.sqrt(
-                self.mean_random_uncorrelated ** 2 +
-                self.total_mean_correlated_uncertainty_min_raster ** 2)
-        if self.mean_random_uncorrelated and self.total_mean_correlated_uncertainty_max_raster:
-            self.total_mean_uncertainty_max_raster = math.sqrt(
-                self.mean_random_uncorrelated ** 2 +
-                self.total_mean_correlated_uncertainty_max_raster ** 2)
+        self.calc_mean_random_correlated_polygon(n_pairs=n_pairs, seed=seed, sigma_func=sigma_func)
+        self.calc_mean_random_correlated_raster(level_of_detail=level_of_detail, n_pairs=n_pairs, seed=seed, sigma_func=sigma_func)
+
+        if self.mean_random_uncorrelated is not None and self.total_mean_correlated_uncertainty_polygon is not None:
+            self.total_mean_uncertainty_polygon = math.sqrt(self.mean_random_uncorrelated ** 2 + self.total_mean_correlated_uncertainty_polygon ** 2)
+        if self.mean_random_uncorrelated is not None and self.total_mean_correlated_uncertainty_min_polygon is not None:
+            self.total_mean_uncertainty_min_polygon = math.sqrt(self.mean_random_uncorrelated ** 2 + self.total_mean_correlated_uncertainty_min_polygon ** 2)
+        if self.mean_random_uncorrelated is not None and self.total_mean_correlated_uncertainty_max_polygon is not None:
+            self.total_mean_uncertainty_max_polygon = math.sqrt(self.mean_random_uncorrelated ** 2 + self.total_mean_correlated_uncertainty_max_polygon ** 2)
+        if self.mean_random_uncorrelated is not None and self.total_mean_correlated_uncertainty_raster is not None:
+            self.total_mean_uncertainty_raster = math.sqrt(self.mean_random_uncorrelated ** 2 + self.total_mean_correlated_uncertainty_raster ** 2)
+        if self.mean_random_uncorrelated is not None and self.total_mean_correlated_uncertainty_min_raster is not None:
+            self.total_mean_uncertainty_min_raster = math.sqrt(self.mean_random_uncorrelated ** 2 + self.total_mean_correlated_uncertainty_min_raster ** 2)
+        if self.mean_random_uncorrelated is not None and self.total_mean_correlated_uncertainty_max_raster is not None:
+            self.total_mean_uncertainty_max_raster = math.sqrt(self.mean_random_uncorrelated ** 2 + self.total_mean_correlated_uncertainty_max_raster ** 2)
 
     def print_results(self) -> None:
         """
-        Nicely format all stored results.
-        Lines whose key quantity is still None are omitted.
+        Pretty-print stored results; omit lines for None values.
         """
-
-        # ------------------------------------------------------------------ helpers
         def _fmt(v, f=".4f"):
-            """Return formatted value or 'NA' if None (but we won’t print NA lines)."""
             return f"{v:{f}}" if v is not None else None
 
         def _triple(label, central, vmin, vmax, f=".4f"):
-            """
-            Print 'label central; min: …; max: …' if *any*
-            of the three numbers is not-None.
-            """
             pieces = []
             if central is not None:
                 pieces.append(_fmt(central, f))
@@ -2064,7 +1590,6 @@ class RegionalUncertaintyEstimator:
             if pieces:
                 print(f"{label}{'; '.join(pieces)}")
 
-        # ----------------------------------------------------------- header stuff
         print("Variogram Analysis Results:")
         if self.ranges is not None:
             print(
@@ -2080,26 +1605,26 @@ class RegionalUncertaintyEstimator:
             )
         if self.nugget is not None:
             print(f"Nugget: {self.nugget:.4f}")
-        print(f"Best Model Parameters: {self.variogram_analysis.best_params}")
+        if self.variogram_analysis.best_params is not None:
+            print(f"Best Model Parameters: {self.variogram_analysis.best_params}")
 
-        # --------------------------------------------------- polygon uncertainties
         print("\nUncertainty Results for Polygon of interest:")
         print(f"Polygon Area (m²): {self.area:.2f}")
         if self.mean_random_uncorrelated is not None:
             print(f"Mean Random Uncorrelated Uncertainty: {self.mean_random_uncorrelated:.4f}")
 
         _triple("Mean Random Correlated 1: ",
-                self.mean_random_correlated_1_polygon,
-                self.mean_random_correlated_1_min_polygon,
-                self.mean_random_correlated_1_max_polygon)
+                getattr(self, "mean_random_correlated_1_polygon", None),
+                getattr(self, "mean_random_correlated_1_min_polygon", None),
+                getattr(self, "mean_random_correlated_1_max_polygon", None))
         _triple("Mean Random Correlated 2: ",
-                self.mean_random_correlated_2_polygon,
-                self.mean_random_correlated_2_min_polygon,
-                self.mean_random_correlated_2_max_polygon)
+                getattr(self, "mean_random_correlated_2_polygon", None),
+                getattr(self, "mean_random_correlated_2_min_polygon", None),
+                getattr(self, "mean_random_correlated_2_max_polygon", None))
         _triple("Mean Random Correlated 3: ",
-                self.mean_random_correlated_3_polygon,
-                self.mean_random_correlated_3_min_polygon,
-                self.mean_random_correlated_3_max_polygon)
+                getattr(self, "mean_random_correlated_3_polygon", None),
+                getattr(self, "mean_random_correlated_3_min_polygon", None),
+                getattr(self, "mean_random_correlated_3_max_polygon", None))
         _triple("Total Mean Correlated Uncertainty (Polygon): ",
                 self.total_mean_correlated_uncertainty_polygon,
                 self.total_mean_correlated_uncertainty_min_polygon,
@@ -2109,32 +1634,32 @@ class RegionalUncertaintyEstimator:
                 self.total_mean_uncertainty_min_polygon,
                 self.total_mean_uncertainty_max_polygon)
 
-        # ------------------------------------------------------- raster section
         print("\nUncertainty Results for Raster:")
         if getattr(self.raster_data_handler, "detailed_area", None) is not None:
             print(f"Detailed raster Area (m²): {self.raster_data_handler.detailed_area:.2f}")
         print(f"Coarse raster Area (m²): {self.raster_data_handler.bbox.area:.2f}")
 
         _triple("Mean Random Correlated 1 (Raster): ",
-                self.mean_random_correlated_1_raster,
-                self.mean_random_correlated_1_min_raster,
-                self.mean_random_correlated_1_max_raster)
+                getattr(self, "mean_random_correlated_1_raster", None),
+                getattr(self, "mean_random_correlated_1_min_raster", None),
+                getattr(self, "mean_random_correlated_1_max_raster", None))
         _triple("Mean Random Correlated 2 (Raster): ",
-                self.mean_random_correlated_2_raster,
-                self.mean_random_correlated_2_min_raster,
-                self.mean_random_correlated_2_max_raster)
+                getattr(self, "mean_random_correlated_2_raster", None),
+                getattr(self, "mean_random_correlated_2_min_raster", None),
+                getattr(self, "mean_random_correlated_2_max_raster", None))
         _triple("Mean Random Correlated 3 (Raster): ",
-                self.mean_random_correlated_3_raster,
-                self.mean_random_correlated_3_min_raster,
-                self.mean_random_correlated_3_max_raster)
+                getattr(self, "mean_random_correlated_3_raster", None),
+                getattr(self, "mean_random_correlated_3_min_raster", None),
+                getattr(self, "mean_random_correlated_3_max_raster", None))
         _triple("Total Mean Correlated Uncertainty (Raster): ",
                 self.total_mean_correlated_uncertainty_raster,
-                self.total_mean_correlated_uncertainty_min_raster,
-                self.total_mean_correlated_uncertainty_max_raster)
+                getattr(self, "total_mean_correlated_uncertainty_min_raster", None),
+                getattr(self, "total_mean_correlated_uncertainty_max_raster", None))
         _triple("Total Mean Uncertainty (Raster): ",
                 self.total_mean_uncertainty_raster,
                 self.total_mean_uncertainty_min_raster,
                 self.total_mean_uncertainty_max_raster)
+
 
 class ApplyUncertainty:
     """
@@ -2168,53 +1693,40 @@ class ApplyUncertainty:
         resolution : float
             Raster cell size (same linear units as ranges).
         rms : float, optional
-            Root‐mean‐square of your data array. If supplied, used for uncorrelated term.
+            Root-mean-square of data values; if provided, uncorrelated term = rms / sqrt(N).
         sills_min, ranges_min, sills_max, ranges_max : sequences, optional
-            Percentile bounds for sills/ranges to get total_min/total_max.
+            Percentile bounds for sills/ranges to compute total_min/total_max.
 
         Returns
         -------
         dict
-            {
-              'uncorrelated': float or None,
-              'correlated': List[float],
-              'total': float,
-              'total_min': float or None,
-              'total_max': float or None
-            }
+            {'uncorrelated', 'correlated', 'total', 'total_min', 'total_max'}
         """
-        # effective sample count
         n = area / (resolution ** 2)
-
-        # uncorrelated term (if rms given)
         uncorr = (rms / math.sqrt(n)) if rms is not None else None
 
-        # correlated terms
         corr = []
         for sill, rng in zip(sills, ranges):
-            term = (math.sqrt(2 * sill) / math.sqrt(n)) * \
-                   math.sqrt((math.pi * rng**2) / (5 * resolution**2))
+            term = (math.sqrt(2.0 * sill) / math.sqrt(n)) * math.sqrt((math.pi * rng ** 2) / (5.0 * resolution ** 2))
             corr.append(term)
 
-        # total quadrature sum
-        total_sq = sum(c**2 for c in corr) + ((uncorr**2) if uncorr is not None else 0)
+        total_sq = sum(c ** 2 for c in corr) + ((uncorr ** 2) if uncorr is not None else 0.0)
         total = math.sqrt(total_sq)
 
-        # optional bounds
         total_min = total_max = None
         if sills_min and ranges_min:
             corr_min = [
-                (math.sqrt(2 * smin) / math.sqrt(n)) * math.sqrt((math.pi * rmin**2) / (5 * resolution**2))
+                (math.sqrt(2.0 * smin) / math.sqrt(n)) * math.sqrt((math.pi * rmin ** 2) / (5.0 * resolution ** 2))
                 for smin, rmin in zip(sills_min, ranges_min)
             ]
-            total_min = math.sqrt(sum(c**2 for c in corr_min) + ((uncorr**2) if uncorr is not None else 0))
+            total_min = math.sqrt(sum(c ** 2 for c in corr_min) + ((uncorr ** 2) if uncorr is not None else 0.0))
 
         if sills_max and ranges_max:
             corr_max = [
-                (math.sqrt(2 * smax) / math.sqrt(n)) * math.sqrt((math.pi * rmax**2) / (5 * resolution**2))
+                (math.sqrt(2.0 * smax) / math.sqrt(n)) * math.sqrt((math.pi * rmax ** 2) / (5.0 * resolution ** 2))
                 for smax, rmax in zip(sills_max, ranges_max)
             ]
-            total_max = math.sqrt(sum(c**2 for c in corr_max) + ((uncorr**2) if uncorr is not None else 0))
+            total_max = math.sqrt(sum(c ** 2 for c in corr_max) + ((uncorr ** 2) if uncorr is not None else 0.0))
 
         return {
             'uncorrelated': uncorr,
@@ -2225,24 +1737,18 @@ class ApplyUncertainty:
         }
 
     @staticmethod
-    def compute_rms_from_tif(
-        tif_path: str,
-        band: int = 1
-    ) -> float:
+    def compute_rms_from_tif(tif_path: str, band: int = 1) -> float:
         """
-        Compute the root‐mean‐square of a GeoTIFF band, ignoring nodata and NaNs.
+        Compute RMS (about zero) of a GeoTIFF band, ignoring nodata and NaNs.
 
         Parameters
         ----------
         tif_path : str
-            Path to the input GeoTIFF.
-        band : int, default 1
-            Raster band to read.
+        band : int
 
         Returns
         -------
         float
-            RMS of all valid (non‐nodata, non‐NaN) pixels.
         """
         with rasterio.open(tif_path) as src:
             arr = src.read(band).astype(float)
@@ -2255,4 +1761,4 @@ class ApplyUncertainty:
         vals = arr[valid]
         if vals.size == 0:
             raise ValueError("No valid pixels found (all nodata or NaN).")
-        return float(np.sqrt(np.mean(vals**2)))
+        return float(np.sqrt(np.mean(vals ** 2)))

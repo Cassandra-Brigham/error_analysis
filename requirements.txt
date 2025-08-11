@@ -2,7 +2,8 @@ geopandas
 ipyleaflet
 ipywidgets
 matplotlib
-numba
+llvmlite>=0.44.0
+numba>=0.61.0
 numpy
 osgeo
 pandas

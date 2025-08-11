@@ -14,6 +14,7 @@ from pathlib import Path
 from typing import Tuple, List, Optional, Iterable
 import uuid
 import statistics
+import base64  # --- Colab fix: for data URLs ---
 
 import numpy as np
 import pandas as pd
@@ -32,7 +33,7 @@ try:
     HAS_LEGEND = True
 except Exception:
     HAS_LEGEND = False
-from ipywidgets import Button, HBox, Label
+from ipywidgets import Button, HBox, Label, Layout  # --- Colab fix: use Layout ---
 from scipy import stats
 
 from differencing_functions import Raster
@@ -127,13 +128,15 @@ class TopoMapInteractor:
             vmin=self.overlay_vmin,
             vmax=self.overlay_vmax,
         )
+        # --- Colab fix: prepare data URL for ImageOverlay ---
+        self._overlay_data_url = self._png_to_data_url(self._overlay_png)
 
         # Initialize map
         center = ((north + south) / 2, (west + east) / 2)
-        self.map = Map(center=center, zoom=zoom, layout={'height': map_size[0], 'width': map_size[1]})
+        self.map = Map(center=center, zoom=zoom, layout=Layout(height=map_size[0], width=map_size[1]))
 
-        # Add image overlay
-        self.overlay_layer = ImageOverlay(url=str(self._overlay_png), bounds=self.latlon_bounds)
+        # Add image overlay (use data URL, not a local filesystem path)
+        self.overlay_layer = ImageOverlay(url=self._overlay_data_url, bounds=self.latlon_bounds)
         self.map.add_layer(self.overlay_layer)
 
         # Legend (safe)
@@ -181,6 +184,12 @@ class TopoMapInteractor:
     def _new_overlay_png_path(self) -> Path:
         stem = Path(self.topo_diff.path).stem
         return self.output_dir / f"{stem}-{uuid.uuid4().hex}.png"
+
+    def _png_to_data_url(self, path: Path | str) -> str:
+        """Return a base64 data URL for a local PNG file (works in Colab)."""
+        with open(path, "rb") as f:
+            b = f.read()
+        return "data:image/png;base64," + base64.b64encode(b).decode("ascii")
 
     def _generate_overlay_png(
         self,
@@ -506,13 +515,16 @@ class TopoMapInteractor:
             vmin=self.overlay_vmin, vmax=self.overlay_vmax
         )
 
+        # --- Colab fix: swap overlay using data URL ---
+        new_data_url = self._png_to_data_url(new_png)
         try:
             self.map.remove_layer(self.overlay_layer)
         except Exception:
             pass
-        self.overlay_layer = ImageOverlay(url=str(new_png), bounds=self.latlon_bounds)
+        self.overlay_layer = ImageOverlay(url=new_data_url, bounds=self.latlon_bounds)
         self.map.add_layer(self.overlay_layer)
         self._overlay_png = new_png
+        self._overlay_data_url = new_data_url
 
     def update_topo_diff(
         self,

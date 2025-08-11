@@ -13,3 +13,4 @@ requests
 rioxarray
 scipy
 shapely
+colormaps
